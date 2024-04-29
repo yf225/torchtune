@@ -16,6 +16,7 @@ from torchtune import utils
 from torchtune.modules.common_utils import reparametrize_as_dtype_state_dict_post_hook
 from torchtune.modules.peft import LoRALinear
 from torchtune.utils.seed import set_seed
+from torchtune.modules.peft.peft_utils import disable_adapter
 
 RANK = 4
 ALPHA = 1.0
@@ -197,3 +198,26 @@ class TestLoRALinear:
         assert torch.allclose(
             lora_linear.weight.quantized_data, lora_linear_reload.weight.quantized_data
         )
+
+    def test_disable_lora(self, inputs, lora_linear) -> None:
+        enabled = lora_linear(inputs)
+
+        with disable_adapter(lora_linear):
+            disabled = lora_linear(inputs)
+
+        # passes
+        assert not torch.allclose(enabled, disabled, atol=1e-4, rtol=1e-4)
+
+    def test_disable_lora_compiled(self, inputs, lora_linear) -> None:
+        with disable_adapter(lora_linear):
+            disabled_no_compile = lora_linear(inputs)
+
+        lora_linear = torch.compile(lora_linear)
+        enabled = lora_linear(inputs)
+
+        with disable_adapter(lora_linear):
+            disabled_compile = lora_linear(inputs)
+
+        # both asserts fail
+        assert not torch.allclose(enabled, disabled_compile, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(disabled_no_compile, disabled_compile)

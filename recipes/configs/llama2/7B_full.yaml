@@ -56,13 +56,14 @@ loss:
   _component_: torch.nn.CrossEntropyLoss
 max_steps_per_epoch: null
 gradient_accumulation_steps: 1
+compile: True
 
 
 # Training env
 device: cuda
 
 # Memory management
-enable_activation_checkpointing: True
+enable_activation_checkpointing: False
 
 # Reduced precision
 dtype: bf16

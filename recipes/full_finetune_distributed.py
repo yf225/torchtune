@@ -182,9 +182,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # ``_setup_model`` handles initialization and loading the state dict. This method
         # should be called before ``_setup_optimizer`` since transforming the optimizer
         # state dict requires the model
+        self._model_compile = cfg.compile
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
+            compile_model=self._model_compile,
             model_state_dict=ckpt_dict[utils.MODEL_KEY],
         )
 
@@ -230,6 +232,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self,
         cfg_model: DictConfig,
         enable_activation_checkpointing: bool,
+        compile_model: bool,
         model_state_dict: Dict[str, Any],
     ) -> nn.Module:
         """
@@ -268,6 +271,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Wrap the model with FSDP. This will ensure that the model is sharded
         # across all available GPUs.
+        if compile_model:
+            # `use_orig_params=True` is required by compile
+            use_orig_params = True
         model = FSDP(
             module=model,
             auto_wrap_policy=ModuleWrapPolicy({modules.TransformerDecoderLayer}),
@@ -285,6 +291,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if not self._is_rank_zero
                 else None
             ),
+            use_orig_params=use_orig_params,
         )
 
         # Ensure no params and buffers are on meta device
@@ -294,6 +301,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
             )
+        # Compile model, if enabled.
+        if compile_model:
+            log.info("Compiling model with torch.compile...")
+            model = utils.wrap_compile(model)
         if self._is_rank_zero:
             memory_stats = utils.memory_stats_log(device=self._device)
             log.info(f"Memory Stats after model init:\n{memory_stats}")
@@ -412,6 +423,11 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         utils.cleanup_before_training()
 
         _, rank = utils.get_world_size_and_rank()
+
+        if self._model_compile:
+            log.info(
+                "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
+            )
 
         # zero out the gradients before starting training
         self._optimizer.zero_grad()
