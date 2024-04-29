@@ -43,15 +43,19 @@ class ChatFormat(ABC):
 class Llama2ChatFormat(ChatFormat):
     """
     Chat format that formats human and system prompts with appropriate tags
-    used in LLaMA2 pre-training. Taken from Meta's official LLaMA inference
-    repository at https://github.com/meta-llama/llama/blob/main/llama/generation.py.
+    used in Llama2 pre-training. Taken from Meta's official `Llama inference
+    repository <https://github.com/meta-llama/llama/blob/main/llama/generation.py>`_.
 
     Example:
-        "[INST] <<SYS>>
-        You are a helpful, respectful and honest assistant.
-        <</SYS>>
+        .. code-block:: text
 
-        I am going to Paris, what should I see? [/INST] Paris, the capital of France, is known for its stunning architecture..."
+            "[INST] <<SYS>>
+            You are a helpful, respectful and honest assistant.
+            <</SYS>>"
+
+            I am going to Paris, what should I see? [/INST] Paris, the capital of France, is known for its stunning architecture..."
+
+
     """
 
     B_INST, E_INST = "[INST]", "[/INST]"
@@ -83,7 +87,7 @@ class Llama2ChatFormat(ChatFormat):
             if message.role == "system":
                 content = cls.system.format(content=message.content)
                 system_message = content
-                # Incorporate the system message in the user message - LLaMA2 only
+                # Incorporate the system message in the user message - Llama2 only
                 # looks for the <<SYS>> tags and not the explicit role so this will
                 # be treated the same as an actual system message. We do this because
                 # of the nesting of the system prompt in the user message.
@@ -104,15 +108,16 @@ class Llama2ChatFormat(ChatFormat):
 
 class MistralChatFormat(ChatFormat):
     """
-    Formats according to Mistral's instruct model:
-    https://docs.mistral.ai/models/
+    Formats according to `Mistral's instruct model <https://docs.mistral.ai/models/>`_.
 
     It is identical to `Llama2ChatFormat`, except it does not support system
     prompts.
 
     Example:
-        "[INST] I am going to Paris, what should I see? [/INST] Paris, the capital
-        of France, is known for its stunning architecture..."
+        .. code-block:: text
+
+            "[INST] I am going to Paris, what should I see? [/INST] Paris, the capital
+            of France, is known for its stunning architecture..."
 
     """
 
@@ -162,17 +167,21 @@ class MistralChatFormat(ChatFormat):
 
 class ChatMLFormat(ChatFormat):
     """
-    OpenAI's Chat Markup Language used by their chat models:
-    https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/ai-services/openai/includes/chat-markup-language.md
+    OpenAI's `Chat Markup Language
+    <https://github.com/MicrosoftDocs/azure-docs/blob/772c14eeabfa0c0c561d5c2d34ef19341f528b7b/articles/ai-services/openai/how-to/chat-markup-language.md>`_
+    used by their chat models.
+
     It is the default chat format used by HuggingFace models.
 
     Example:
-        <|im_start|>system
-        Provide some context and/or instructions to the model.<|im_end|>
-        <|im_start|>user
-        The user’s message goes here<|im_end|>
-        <|im_start|>assistant
-        The assistant’s response goes here<|im_end|>
+        .. code-block:: text
+
+            <|im_start|>system
+            Provide some context and/or instructions to the model.<|im_end|>
+            <|im_start|>user
+            The user’s message goes here<|im_end|>
+            <|im_start|>assistant
+            The assistant’s response goes here<|im_end|>
     """
 
     IM_START, IM_END = "<|im_start|>", "<|im_end|>"

@@ -4,20 +4,26 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtune.data import Llama2ChatFormat, sharegpt_to_llama2_messages
+from typing import Optional
+
+from torchtune.data import ChatFormat, Llama2ChatFormat, sharegpt_to_llama2_messages
 
 from torchtune.datasets._chat import ChatDataset
 
-from torchtune.modules import Tokenizer
+from torchtune.modules.tokenizers import Tokenizer
 
 
 def slimorca_dataset(
-    tokenizer: Tokenizer, max_seq_len: int = 1024, train_on_input: bool = False
+    *,
+    tokenizer: Tokenizer,
+    source: str = "Open-Orca/SlimOrca-Dedup",
+    chat_format: Optional[ChatFormat] = Llama2ChatFormat,
+    max_seq_len: int = 1024,
+    train_on_input: bool = False,
 ) -> ChatDataset:
     """
-    PyTorch Representation of the SlimOrca Dataset
-    https://huggingface.co/datasets/Open-Orca/SlimOrca-Dedup
-    from Hugging Face.
+    Support for `SlimOrca-style <https://huggingface.co/datasets/Open-Orca/SlimOrca-Dedup>`_
+    family of conversational datasets.
 
     The data is formatted to adhere to Llama2 Chat Format.
     This format is required if the base model is Llama2 Chat Model.
@@ -28,10 +34,12 @@ def slimorca_dataset(
     input token id list is ensured (by truncation if necessary) to be within
     that length.
 
-    Data input format: https://huggingface.co/datasets/Open-Orca/SlimOrca-Dedup#dataset-format
-
     Args:
         tokenizer (Tokenizer): Tokenizer used to encode data. Tokenize must implement an `encode` and `decode` method.
+        source (str): path string of dataset, anything supported by Hugging Face's `load_dataset`.
+        chat_format (Optional[ChatFormat]): template used to format the chat. If the placeholder variable
+            names in the template do not match the column/key names in the dataset, use `column_map` to map them.
+            See the description in :class:`~torchtune.datasets.ChatDataset` for more details. Default: Llama2ChatFormat
         max_seq_len (int): Maximum number of tokens in the returned input and label token id lists.
             This value needs to be at least 4 though it is generally set to max sequence length accepted by the model.
             Default is 1024.
@@ -41,7 +49,7 @@ def slimorca_dataset(
         ValueError: If `max_seq_len` is less than 4.
 
     Returns:
-        ChatDataset: dataset configured with SlimOrca source data and LLaMA2 chat template
+        ChatDataset: dataset configured with SlimOrca source data and Llama2 chat template
 
     Example:
         >>> ds = slimorca_dataset(tokenizer=tokenizer, max_seq_len=10)
@@ -60,9 +68,9 @@ def slimorca_dataset(
 
     return ChatDataset(
         tokenizer=tokenizer,
-        source="Open-Orca/SlimOrca-Dedup",
+        source=source,
         convert_to_messages=sharegpt_to_llama2_messages,
-        chat_format=Llama2ChatFormat,
+        chat_format=chat_format,
         max_seq_len=max_seq_len,
         train_on_input=train_on_input,
         split="train",

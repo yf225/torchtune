@@ -3,7 +3,7 @@
 #
 # This config assumes that you've run the following command before launching
 # this run:
-#   tune download meta-llama/Llama-2-7b --hf-token <HF_TOKEN> --output-dir /tmp/llama2
+#   tune download meta-llama/Llama-2-7b-hf --output-dir /tmp/Llama-2-7b-hf --hf-token <HF_TOKEN>
 #
 # To launch on 2 devices, run the following command from root:
 #   tune run --nnodes 1 --nproc_per_node 2 lora_finetune_distributed --config llama2/7B_lora
@@ -74,7 +74,8 @@ output_dir: /tmp/lora_finetune_output
 metric_logger:
   _component_: torchtune.utils.metric_logging.DiskLogger
   log_dir: ${output_dir}
-log_every_n_steps: null
+log_every_n_steps: 1
+log_peak_memory_stats: False
 
 # Environment
 device: cuda

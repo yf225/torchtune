@@ -3,6 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import itertools
 import sys
 import time
 from typing import Any, Dict
@@ -91,12 +92,9 @@ class InferenceRecipe:
         # to get the accurate performance measurement
         if self._quantization_mode is not None:
             logger.info("Starting compilation to improve generation performance ...")
-            t0 = time.perf_counter()
             custom_generate_next_token = torch.compile(
                 utils.generate_next_token, mode="max-autotune", fullgraph=True
             )
-            t = time.perf_counter() - t0
-            logger.info(f"Compilation for generate_next_token takes: {t:.02f} sec")
             t0 = time.perf_counter()
             _ = utils.generate(
                 model=self._model,
@@ -104,7 +102,7 @@ class InferenceRecipe:
                 max_generated_tokens=2,
                 temperature=cfg.temperature,
                 top_k=cfg.top_k,
-                eos_id=self._tokenizer.eos_id,
+                stop_tokens=self._tokenizer.stop_tokens,
                 custom_generate_next_token=custom_generate_next_token,
             )
             t = time.perf_counter() - t0
@@ -117,18 +115,28 @@ class InferenceRecipe:
             max_generated_tokens=cfg.max_new_tokens,
             temperature=cfg.temperature,
             top_k=cfg.top_k,
-            eos_id=self._tokenizer.eos_id,
+            stop_tokens=self._tokenizer.stop_tokens,
             custom_generate_next_token=custom_generate_next_token,
         )
         t = time.perf_counter() - t0
 
         logger.info(self._tokenizer.decode(generated_tokens))
 
+        model_size = sum(
+            [
+                p.numel() * p.dtype.itemsize
+                for p in itertools.chain(
+                    self._model.parameters(), self._model.buffers()
+                )
+            ]
+        )
+
         tokens_generated = len(generated_tokens) - prompt.size(0)
         tokens_sec = tokens_generated / t
         logger.info(
             f"Time for inference: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec"
         )
+        logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
         logger.info(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 

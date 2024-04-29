@@ -168,8 +168,6 @@ will be easier than overriding all of these elements through the CLI.
 .. code-block:: bash
 
     tune cp eleuther_evaluation ./custom_eval_config.yaml \
-    checkpointer.checkpoint_dir=<checkpoint_dir> \
-    tokenizer.path=<checkpoint_dir>/tokenizer.model
 
 For this tutorial we'll use the ``truthfulqa_mc2`` task from the harness.
 This task measures a model's propensity to be truthful when answering questions and
@@ -180,6 +178,8 @@ responses and one or more false responses. Let's first run a baseline without fi
 .. code-block:: bash
 
     tune run eleuther_eval --config ./custom_eval_config.yaml
+    checkpointer.checkpoint_dir=<checkpoint_dir> \
+    tokenizer.path=<checkpoint_dir>/tokenizer.model
 
     [evaluator.py:324] Running loglikelihood requests
     [eleuther_eval.py:195] Eval completed in 121.27 seconds.
@@ -521,6 +521,32 @@ The output should look something like this:
 
 
 And thats it! Try your own prompt!
+
+Uploading your model to the Hugging Face Hub
+--------------------------------------------
+
+Your new model is working great and you want to share it with the world. The easiest way to do this
+is utilizing the ``huggingface-cli`` command, which works seamlessly with torchtune. Simply point the CLI
+to your finetuned model directory like so:
+
+.. code-block:: bash
+
+    huggingface-cli upload <hf-repo-id> <checkpoint-dir>
+
+The command should output a link to your repository on the Hub. If the repository doesn't exist yet, it will
+be created automatically:
+
+.. code-block:: text
+
+    https://huggingface.co/<hf-repo-id>/tree/main/.
+
+.. note::
+
+    Before uploading, make sure you are `authenticated with Hugging Face <https://huggingface.co/docs/huggingface_hub/quick-start#authentication>`_ by running ``huggingface-cli login``.
+
+For more details on the ``huggingface-cli upload`` feature check out the `Hugging Face docs <https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-upload>`_.
+
+|
 
 Hopefully this tutorial gave you some insights into how you can use torchtune for
 your own workflows. Happy Tuning!

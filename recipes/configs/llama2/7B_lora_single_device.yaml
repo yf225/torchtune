@@ -3,7 +3,7 @@
 #
 # This config assumes that you've run the following command before launching
 # this run:
-#   tune download meta-llama/Llama-2-7b --hf-token <HF_TOKEN> --output-dir /tmp/llama2
+#   tune download meta-llama/Llama-2-7b-hf --output-dir /tmp/Llama-2-7b-hf --hf-token <HF_TOKEN>
 #
 # To launch on a single device, run the following command from root:
 #   tune run lora_finetune_single_device --config llama2/7B_lora_single_device
@@ -73,7 +73,8 @@ output_dir: /tmp/lora_finetune_output
 metric_logger:
   _component_: torchtune.utils.metric_logging.DiskLogger
   log_dir: ${output_dir}
-log_every_n_steps: null
+log_every_n_steps: 1
+log_peak_memory_stats: False
 
 # Environment
 device: cuda
@@ -85,4 +86,4 @@ enable_activation_checkpointing: True
 profiler:
   _component_: torchtune.utils.profiler
   enabled: False
-  output_dir: /tmp/alpaca-llama2-finetune/torchtune_perf_tracing.json
+  output_dir: ${output_dir}/torchtune_perf_tracing.json

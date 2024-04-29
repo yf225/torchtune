@@ -1,8 +1,8 @@
 .. _finetune_llama_label:
 
-=======================
-Finetune your first LLM
-=======================
+========================
+Fine-Tune Your First LLM
+========================
 
 This guide will walk you through the process of launching your first finetuning
 job using torchtune.
@@ -97,6 +97,8 @@ a single device. For a more in-depth discussion on LoRA in torchtune, you can se
   features like FSDP that are only required for distributed training.
 
 |
+
+.. _tune_cp_label:
 
 Modifying a config
 ------------------
