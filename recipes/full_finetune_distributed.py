@@ -32,6 +32,55 @@ from torchtune.utils.activations import apply_selective_activation_checkpointing
 
 from tqdm import tqdm
 
+from torch._dynamo import compiled_autograd
+import contextlib
+import os
+import uuid
+import urllib
+
+from torch.profiler import profile, ProfilerActivity
+import subprocess
+
+PERFETTO_UI_ROOT_URL = (
+    "https://interncache-all.fbcdn.net/manifold/perfetto-artifacts/tree/ui/index.html"
+)
+MANIFOLD_FOLDER = "perfetto_internal_traces/tree/shared_trace"
+DEFAULT_TTL_SEC = 28 * 24 * 60 * 60
+
+def upload_trace_file(local_path: str, overwrite: bool = False):
+    file_name = os.path.basename(local_path)
+    manifold_path = os.path.join(
+        MANIFOLD_FOLDER, f"{os.getlogin()}_{str(uuid.uuid4())}_{file_name}"
+    )
+    cmd = [
+        "manifold",
+        "put",
+        local_path,
+        manifold_path,
+        "--ttl",
+        str(DEFAULT_TTL_SEC),
+        "--userData",
+        "false",
+    ]
+    ret = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
+    )
+    if ret.returncode == 0:
+        print("Uploaded trace successfully.")
+        return manifold_path
+    else:
+        print("[ERROR] Upload failed, maybe the trace file exists.")
+        return None
+
+
+def print_perfetto_ui_url(manifold_path: str) -> None:
+    url = (
+        PERFETTO_UI_ROOT_URL
+        + "#!/?url=https://interncache-all.fbcdn.net/manifold/"
+        + urllib.parse.quote_plus(manifold_path)
+    )
+    print(f"The trace is accessible at:\n{url}")
+
 
 log = utils.get_logger("DEBUG")
 
@@ -125,6 +174,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self.max_steps_per_epoch = cfg.max_steps_per_epoch
         self.global_step = 0
 
+        self._use_fsdp2 = cfg.use_fsdp2
+        self._model_compile = cfg.compile
+        self._compile_fsdp = cfg.compile_fsdp
+
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
         Extract the checkpoint state from file and validate. If resume_from_checkpoint
@@ -182,11 +235,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # ``_setup_model`` handles initialization and loading the state dict. This method
         # should be called before ``_setup_optimizer`` since transforming the optimizer
         # state dict requires the model
-        self._model_compile = cfg.compile
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
-            compile_model=self._model_compile,
             memory_efficient_fsdp_wrap=cfg.get("memory_efficient_fsdp_wrap", False),
             model_state_dict=ckpt_dict[utils.MODEL_KEY],
             ac_mode=cfg.get("ac_mode", None),
@@ -235,7 +286,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         self,
         cfg_model: DictConfig,
         enable_activation_checkpointing: bool,
-        compile_model: bool,
         memory_efficient_fsdp_wrap: bool,
         model_state_dict: Dict[str, Any],
         ac_mode: Optional[str] = None,
@@ -293,31 +343,68 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         # Wrap the model with FSDP. This will ensure that the model is sharded
         # across all available GPUs.
-        if compile_model:
+        if self._model_compile:
             # `use_orig_params=True` is required by compile
             use_orig_params = True
-        model = FSDP(
-            module=model,
-            auto_wrap_policy=utils.get_full_finetune_fsdp_wrap_policy(
-                memory_efficient_fsdp_wrap=memory_efficient_fsdp_wrap,
-                modules_to_wrap={modules.TransformerDecoderLayer},
-            ),
-            sharding_strategy=torch.distributed.fsdp.ShardingStrategy.FULL_SHARD,
-            device_id=self._device,
-            # this recipe does not currently support mixed precision training
-            mixed_precision=None,
-            # Ensure we broadcast params and buffers from rank 0
-            sync_module_states=True,
-            # Initialize empty modules on all non-zero ranks
-            param_init_fn=(
+        else:
+            use_orig_params = False  # default for FSDP1
+
+        if self._use_fsdp2:
+            log.info("Using FSDP2")
+            # if not self._is_rank_zero:
+            model.apply(
                 lambda module: module.to_empty(
                     device=torch.device("cuda"), recurse=False
                 )
-                if not self._is_rank_zero
-                else None
-            ),
-            use_orig_params=use_orig_params,
-        )
+            )
+            fsdp_config = {
+                "reshard_after_forward": True,
+                "_reshard_after_forward_root": self._compile_fsdp,
+            }
+            for layer_id, transformer_decoder_layer in enumerate(model.layers):
+                torch.distributed._composable.fsdp.fully_shard(transformer_decoder_layer, **fsdp_config)
+                model.layers[layer_id] = transformer_decoder_layer
+            model = torch.distributed._composable.fsdp.fully_shard(model, **fsdp_config)
+            torch._dynamo.config.error_on_recompile = True
+            torch._inductor.config.triton.cudagraphs = True
+            torch._functorch.config.move_view_chain_to_bwd_graph = True
+            torch._functorch.config.aggressive_recomputation = False
+            torch._inductor.config.reorder_for_compute_comm_overlap = True
+            torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+                "sink_waits",
+                "raise_comms",
+            ]
+            torch._inductor.config.allow_buffer_reuse = True
+            torch._inductor.config.inplace_buffers = True
+            torch._inductor.config.raise_last_usage = True
+        else:
+            log.info("Using FSDP1")
+            model = FSDP(
+                module=model,
+                auto_wrap_policy=utils.get_full_finetune_fsdp_wrap_policy(
+                    memory_efficient_fsdp_wrap=memory_efficient_fsdp_wrap,
+                    modules_to_wrap={modules.TransformerDecoderLayer},
+                ),
+                sharding_strategy=torch.distributed.fsdp.ShardingStrategy.FULL_SHARD,
+                device_id=self._device,
+                # this recipe does not currently support mixed precision training
+                mixed_precision=None,
+                # Ensure we broadcast params and buffers from rank 0
+                sync_module_states=True,
+                # Initialize empty modules on all non-zero ranks
+                param_init_fn=(
+                    lambda module: module.to_empty(
+                        device=torch.device("cuda"), recurse=False
+                    )
+                    if not self._is_rank_zero
+                    else None
+                ),
+                use_orig_params=use_orig_params,
+            )
+            torch._inductor.config.triton.cudagraphs = True
+            torch._functorch.config.aggressive_recomputation = False
+            torch._inductor.config.reorder_for_compute_comm_overlap = False
+            torch._inductor.config.raise_last_usage = False
 
         # Ensure no params and buffers are on meta device
         utils.validate_no_params_on_meta_device(model)
@@ -327,10 +414,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
             )
-        # Compile model, if enabled.
-        if compile_model:
-            log.info("Compiling model with torch.compile...")
-            model = utils.wrap_compile(model)
         if self._is_rank_zero:
             memory_stats = utils.get_memory_stats(device=self._device)
             utils.log_memory_stats(memory_stats)
@@ -456,10 +539,10 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         _, rank = utils.get_world_size_and_rank()
 
-        if self._model_compile:
-            log.info(
-                "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
-            )
+        # if self._model_compile:
+        #     log.info(
+        #         "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
+        #     )
 
         # zero out the gradients before starting training
         self._optimizer.zero_grad()
@@ -469,6 +552,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
 
+        def compiled_autograd_compiler_fn(gm):
+            log.info(f"Compiling autograd...")
+            return torch.compile(gm, backend="inductor", fullgraph=True)
+
+        model_warmed_up = False
+
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
 
@@ -477,70 +566,115 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._sampler.set_epoch(curr_epoch)
 
             pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
-            for idx, batch in enumerate(self._dataloader):
-                if (
-                    self.max_steps_per_epoch is not None
-                    and (idx // self._gradient_accumulation_steps)
-                    == self.max_steps_per_epoch
-                ):
-                    break
+            # with utils.profiler(enabled=True):
 
-                input_ids, labels = batch
-                input_ids = input_ids.to(self._device)
-                num_tokens += input_ids.numel()
-                labels = labels.to(self._device)
-
-                logits = self._model(input_ids)
-                # Shift so that tokens < n predict n
-                logits = logits[..., :-1, :].contiguous()
-                labels = labels[..., 1:].contiguous()
-                logits = logits.transpose(1, 2)
-                # Compute loss
-                loss = self._loss_fn(logits, labels)
-
-                loss = loss / self._gradient_accumulation_steps
-                running_loss += loss
-                loss.backward()
-
-                # Step with optimizer
-                if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    self._optimizer.step()
-                    self._optimizer.zero_grad(set_to_none=True)
-
-                    # Update the number of steps when the weights are updated
-                    self.global_step += 1
-
-                    loss_to_log = running_loss.item()
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Log per-step metrics
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True) as prof:
+                for idx, batch in enumerate(self._dataloader):
                     if (
-                        self.global_step % self._log_every_n_steps == 0
-                        and self._is_rank_zero
+                        self.max_steps_per_epoch is not None
+                        and (idx // self._gradient_accumulation_steps)
+                        == self.max_steps_per_epoch
                     ):
-                        time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_to_log,
-                            "lr": self._optimizer.param_groups[0]["lr"],
-                            "tokens_per_second_per_gpu": num_tokens / time_per_step,
-                        }
-                        if self._log_peak_memory_stats:
-                            log_dict.update(utils.get_memory_stats(device=self._device))
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
+                        break
+
+                    input_ids, labels = batch
+                    # HACK(yf225): force static shape
+                    pad_to_size = 128
+                    if input_ids.shape[1] > pad_to_size:
+                        input_ids = input_ids[:, :pad_to_size]
+                        labels = labels[:, :pad_to_size]
+                    else:
+                        input_ids = torch.cat([input_ids, torch.zeros(input_ids.shape[0], pad_to_size-input_ids.shape[1], dtype=torch.long)], dim=1)
+                        labels = torch.cat([labels, torch.zeros(labels.shape[0], pad_to_size-labels.shape[1], dtype=torch.long)], dim=1)
+
+                    input_ids = input_ids.to(self._device)
+                    # log.info(f"input_ids.shape: {input_ids.shape}")
+                    # torch._dynamo.mark_dynamic(input_ids, 1)  # unfortunately this doesn't help avoid recompile, might need to mark more places
+
+                    num_tokens += input_ids.numel()
+                    labels = labels.to(self._device)
+
+                    # log.info(f"iteration: {idx}")
+
+                    if self._compile_fsdp and model_warmed_up:
+                        assert self._use_fsdp2, "FSDP2 is required for Compiled FSDP!"
+                        compiled_autograd_ctx = compiled_autograd.enable(compiled_autograd_compiler_fn)
+                    else:
+                        compiled_autograd_ctx = contextlib.nullcontext()
+
+                    if not model_warmed_up:
+                        # Do FSDP 1st iteration in eager, to lazy-init FSDP state
+                        self._model(input_ids)
+                        model_warmed_up = True
+                    else:
+                        # Compile model, if enabled.
+                        if self._model_compile and not isinstance(self._model, torch._dynamo.OptimizedModule):
+                            log.info(f"Compiling model with torch.compile... compile_fsdp: {self._compile_fsdp}")
+                            self._model = utils.wrap_compile(self._model, fullgraph=self._compile_fsdp)
+
+                    with compiled_autograd_ctx:
+                        logits = self._model(input_ids)
+                        # Shift so that tokens < n predict n
+                        logits = logits[..., :-1, :].contiguous()
+                        labels = labels[..., 1:].contiguous()
+                        logits = logits.transpose(1, 2)
+                        # Compute loss
+                        loss = self._loss_fn(logits, labels)
+
+                        loss = loss / self._gradient_accumulation_steps
+                        running_loss += loss
+                        loss.backward()
+
+                    # Step with optimizer
+                    if (idx + 1) % self._gradient_accumulation_steps == 0:
+                        self._optimizer.step()
+                        self._optimizer.zero_grad(set_to_none=True)
+
+                        # Update the number of steps when the weights are updated
+                        self.global_step += 1
+
+                        loss_to_log = running_loss.item()
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{curr_epoch+1}|{self.global_step}|Loss: {loss_to_log}"
                         )
 
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
+                        # Log per-step metrics
+                        if (
+                            self.global_step % self._log_every_n_steps == 0
+                            and self._is_rank_zero
+                        ):
+                            time_per_step = time.perf_counter() - t0
+                            log_dict = {
+                                "loss": loss_to_log,
+                                "lr": self._optimizer.param_groups[0]["lr"],
+                                "tokens_per_second_per_gpu": num_tokens / time_per_step,
+                            }
+                            if self._log_peak_memory_stats:
+                                log_dict.update(utils.get_memory_stats(device=self._device))
+                            self._metric_logger.log_dict(
+                                log_dict,
+                                step=self.global_step,
+                            )
+
+                        # Reset running stats for the next step
+                        running_loss = 0
+                        num_tokens = 0
+                        t0 = time.perf_counter()
+
+            if torch.distributed.get_rank() == 0:
+                profiler_trace_path = "./torchtune_perf_tracing.json"
+                prof.export_chrome_trace(profiler_trace_path)
+                if not os.path.exists(profiler_trace_path):
+                    raise Exception(f"[ERROR] The trace file doesn't exist: {profiler_trace_path}")
+                manifold_path = upload_trace_file(profiler_trace_path)
+                if manifold_path:
+                    print_perfetto_ui_url(manifold_path)
+                # export_memory_snapshot(memory_snapshot_file_prefix)
+                # stop_record_memory_history()
 
             self.epochs_run += 1
-            self.save_checkpoint(epoch=curr_epoch)
+            # self.save_checkpoint(epoch=curr_epoch)
 
     def cleanup(self) -> None:
         if self._is_rank_zero:

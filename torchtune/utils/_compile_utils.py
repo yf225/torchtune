@@ -12,7 +12,7 @@ from torch import nn
 _TORCH_COMPILE_WRAPPER_PREFIX = "_orig_mod."
 
 
-def wrap_compile(model: nn.Module) -> None:
+def wrap_compile(model: nn.Module, fullgraph: bool) -> None:
     """
     Wraps the model with torch.compile. This function will also
         register a state_dict post hook that allows state_dicts produced
@@ -30,8 +30,8 @@ def wrap_compile(model: nn.Module) -> None:
     # Currently only used in unittesting to work around https://github.com/pytorch/torchtune/issues/676
     backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
     # torch._dynamo.config.cache_size_limit = 1
-    model = torch.compile(model, backend=backend, dynamic=False)
-    model._register_state_dict_hook(_remove_torch_compile_prefix)
+    model = torch.compile(model, backend=backend, dynamic=False, fullgraph=fullgraph)
+    # model._register_state_dict_hook(_remove_torch_compile_prefix)
     return model
 
 
