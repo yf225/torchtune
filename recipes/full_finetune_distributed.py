@@ -598,6 +598,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
                     if self._compile_fsdp and model_warmed_up:
                         assert self._use_fsdp2, "FSDP2 is required for Compiled FSDP!"
+                        # TODO(yf225): switch to using backend="eager" to do warmup run!
                         compiled_autograd_ctx = compiled_autograd.enable(compiled_autograd_compiler_fn)
                     else:
                         compiled_autograd_ctx = contextlib.nullcontext()
