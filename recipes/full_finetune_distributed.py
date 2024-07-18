@@ -341,7 +341,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if not self._is_rank_zero
                 else None
             ),
-            use_orig_params=True,
+            use_orig_params=True if compile_model else False,
         )
 
         # Ensure no params and buffers are on meta device
