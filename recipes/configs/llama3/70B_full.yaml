@@ -74,7 +74,6 @@ resume_from_checkpoint: False
 # Fine-tuning arguments
 batch_size: 2
 epochs: 3
-compile: False
 
 optimizer:
   _component_: torch.optim.AdamW
