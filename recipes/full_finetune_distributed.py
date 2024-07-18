@@ -6,6 +6,7 @@
 
 import sys
 import time
+import os
 
 from functools import partial
 from typing import Any, Dict, Optional, Tuple
@@ -206,6 +207,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         # ``_setup_model`` handles initialization and loading the state dict. This method
         # should be called before ``_setup_optimizer`` since transforming the optimizer
         # state dict requires the model
+        self._model_compile = cfg.compile
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
@@ -214,6 +216,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             model_state_dict=ckpt_dict[utils.MODEL_KEY],
             ac_mode=cfg.get("ac_mode", None),
             ac_option=cfg.get("ac_option", None),
+            compile_model=self._model_compile,
         )
 
         self._tokenizer = config.instantiate(cfg.tokenizer)
@@ -263,6 +266,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         model_state_dict: Dict[str, Any],
         ac_mode: Optional[str] = None,
         ac_option: Optional[int] = None,
+        compile_model: bool = False,
     ) -> nn.Module:
         """
         Model initialization has some important considerations:
@@ -337,6 +341,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 if not self._is_rank_zero
                 else None
             ),
+            use_orig_params=True,
         )
 
         # Ensure no params and buffers are on meta device
@@ -347,6 +352,12 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
             )
+
+        # Compile model, if enabled.
+        if compile_model:
+            log.info("Compiling model with torch.compile...")
+            backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+            model.compile(backend=backend)
 
         if self._is_rank_zero:
             memory_stats = utils.get_memory_stats(device=self._device)
