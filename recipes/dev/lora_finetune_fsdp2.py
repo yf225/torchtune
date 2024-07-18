@@ -209,6 +209,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
 
+        self._model_compile = cfg.compile
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
@@ -219,6 +220,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 else None
             ),
             cfg_fsdp=cfg.fsdp if hasattr(cfg, "fsdp") else None,
+            compile_model=self._model_compile,
         )
         self._tokenizer = config.instantiate(cfg.tokenizer)
 
@@ -271,6 +273,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         base_model_state_dict: Dict[str, Any],
         lora_weights_state_dict: Optional[Dict[str, Any]] = None,
         cfg_fsdp: Optional[Union[DictConfig, None]] = None,
+        compile_model: bool = False,
     ) -> nn.Module:
         """
         Model initialization has some important considerations:
@@ -358,6 +361,12 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         )
         # Ensure no params and buffers are on meta device
         utils.validate_no_params_on_meta_device(model)
+
+        # Compile model, if enabled.
+        if compile_model:
+            log.info("Compiling model with torch.compile...")
+            backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+            model.compile(backend=backend)
 
         if self._is_rank_zero:
             log.info(
