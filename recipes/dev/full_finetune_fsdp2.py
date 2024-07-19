@@ -6,9 +6,10 @@
 
 import sys
 import time
+import os
 
 from functools import partial
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 from warnings import warn
 
 import torch
@@ -16,20 +17,16 @@ from omegaconf import DictConfig, ListConfig
 
 from torch import nn
 from torch.distributed import init_process_group
-from torch.distributed.fsdp import (
-    CPUOffload,
-    FullOptimStateDictConfig,
-    FullStateDictConfig,
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-)
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, DistributedSampler
 
 from torchtune import config, modules, utils
 from torchtune.datasets import ConcatDataset
 from torchtune.recipe_interfaces import FTRecipeInterface
-from torchtune.utils.activations import apply_selective_activation_checkpointing
+from torch.distributed._composable.fsdp import fully_shard
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    CheckpointWrapper,
+)
 
 from tqdm import tqdm
 
@@ -203,6 +200,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         ckpt_dict = self.load_checkpoint(cfg.checkpointer)
 
+        self._model_compile = cfg.compile
         # ``_setup_model`` handles initialization and loading the state dict. This method
         # should be called before ``_setup_optimizer`` since transforming the optimizer
         # state dict requires the model
@@ -210,10 +208,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
             memory_efficient_fsdp_wrap=cfg.get("memory_efficient_fsdp_wrap", False),
-            fsdp_cpu_offload=cfg.get("fsdp_cpu_offload", False),
             model_state_dict=ckpt_dict[utils.MODEL_KEY],
-            ac_mode=cfg.get("ac_mode", None),
-            ac_option=cfg.get("ac_option", None),
+            cfg_fsdp=cfg.fsdp if hasattr(cfg, "fsdp") else None,
+            compile_model=self._model_compile,
         )
 
         self._tokenizer = config.instantiate(cfg.tokenizer)
@@ -259,10 +256,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         cfg_model: DictConfig,
         enable_activation_checkpointing: bool,
         memory_efficient_fsdp_wrap: bool,
-        fsdp_cpu_offload: bool,
         model_state_dict: Dict[str, Any],
-        ac_mode: Optional[str] = None,
-        ac_option: Optional[int] = None,
+        cfg_fsdp: Optional[Union[DictConfig, None]] = None,
+        compile_model: bool = False,
     ) -> nn.Module:
         """
         Model initialization has some important considerations:
@@ -278,82 +274,70 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         """
         if self._is_rank_zero:
             log.info("FSDP is enabled. Instantiating Model on CPU for Rank 0 ...")
-            init_start = time.perf_counter()
+            # init_start = time.perf_counter()
 
-            with utils.set_default_dtype(self._dtype):
-                model = config.instantiate(cfg_model)
-
-            log.info(
-                f"Model instantiation took {time.perf_counter() - init_start:.2f} secs"
-            )
-
-            # Load both the model weights. This should happen only on Rank 0
-            model.load_state_dict(model_state_dict)
-
-        else:
-            # For non-zero ranks, load the model on meta device
-            with utils.set_default_dtype(self._dtype), torch.device("meta"):
-                model = config.instantiate(cfg_model)
+        with utils.set_default_dtype(self._dtype), torch.device("meta"):
+            model = config.instantiate(cfg_model)
 
         if self._dtype == torch.bfloat16:
             model = model.to(torch.bfloat16)
 
-        # We currently have two versions of activation checkpointing in this recipe
-        # for testing and BC purposes. ``enable_activation_checkpointing`` controls
-        # the older version of AC and this behavior is unchanged
-        # ac_mode and ac_option together control selective AC. This is only enabled
-        # when these are set AND ``enable_activation_checkpointing`` is set to False
-        # We'll clean this up as soon as testing of AC is complete
-        ac_mode = ac_mode
-        ac_option = ac_option
-
-        if (not enable_activation_checkpointing) and (ac_mode is not None):
-            apply_selective_activation_checkpointing(
-                model,
-                ac_mode,
-                ac_option,
-            )
-        
-        if self._is_rank_zero:
-            print(f"before: model: {model}")
-
-        # Wrap the model with FSDP. This will ensure that the model is sharded
-        # across all available GPUs.
-        model = FSDP(
-            module=model,
-            auto_wrap_policy=utils.get_full_finetune_fsdp_wrap_policy(
-                memory_efficient_fsdp_wrap=memory_efficient_fsdp_wrap,
-                modules_to_wrap={modules.TransformerDecoderLayer},
-            ),
-            cpu_offload=CPUOffload(offload_params=fsdp_cpu_offload),
-            sharding_strategy=torch.distributed.fsdp.ShardingStrategy.FULL_SHARD,
-            device_id=self._device,
-            # this recipe does not currently support mixed precision training
-            mixed_precision=None,
-            # Ensure we broadcast params and buffers from rank 0
-            sync_module_states=True,
-            # Initialize empty modules on all non-zero ranks
-            param_init_fn=(
-                lambda module: module.to_empty(
-                    device=torch.device("cuda"), recurse=False
-                )
-                if not self._is_rank_zero
-                else None
-            ),
+        model._apply(
+            lambda t: torch.empty_like(t, device="cpu")
+            if isinstance(t, torch.nn.Parameter) else torch.empty_like(t, device="cuda"),
+            recurse=True,
         )
 
-        # Ensure no params and buffers are on meta device
-        utils.validate_no_params_on_meta_device(model)
+        # Load both the model weights. This should happen only on Rank 0
+        model.load_state_dict(model_state_dict)
 
-        # original activation checkpointing (full) - flip the condition above
-        if enable_activation_checkpointing and ac_mode is None:
+        if self._is_rank_zero:
+            print(f"self._dtype: {self._dtype}")
+
+        if enable_activation_checkpointing:
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
             )
 
         if self._is_rank_zero:
+            print(f"before: model: {model}")
+
+        fsdp_kwargs = {}
+        if cfg_fsdp and cfg_fsdp.cpu_offload:
+            from torch.distributed._composable.fsdp import CPUOffloadPolicy
+
+            fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+        for m_name, m in reversed(list(model.named_modules())):
+            if memory_efficient_fsdp_wrap:
+                if isinstance(m, nn.Embedding):
+                    fully_shard(m, **fsdp_kwargs)
+            # TransformerDecoderLayer is wrapped by CheckpointWrapper
+            # when enable_activation_checkpointing
+            if enable_activation_checkpointing:
+                if isinstance(m, CheckpointWrapper):
+                    fully_shard(m, **fsdp_kwargs)
+            else:
+                if isinstance(m, modules.TransformerDecoderLayer):
+                    fully_shard(m, **fsdp_kwargs)
+
+        if memory_efficient_fsdp_wrap:
+            fully_shard(model.output, **fsdp_kwargs)
+
+        fully_shard(model, **fsdp_kwargs)
+
+        if self._is_rank_zero:
             print(f"after: model: {model}")
 
+        # Ensure no params and buffers are on meta device
+        utils.validate_no_params_on_meta_device(model)
+
+        # Compile model, if enabled.
+        if compile_model:
+            log.info("Compiling model with torch.compile...")
+            backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+            torch._dynamo.config.inline_inbuilt_nn_modules = True
+            model.compile(backend=backend)
+    
         if self._is_rank_zero:
             memory_stats = utils.get_memory_stats(device=self._device)
             utils.log_memory_stats(memory_stats)
@@ -379,7 +363,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             optimizer.load_state_dict(opt_state_dict)
 
         if self._is_rank_zero:
-            log.info("Optimizer is initialized.")
+            log.info(f"Optimizer is initialized: {optimizer}, type: {type(optimizer)}")
+            # log.info(f"optimizer.param_groups: {optimizer.param_groups}")
         return optimizer
 
     def _setup_data(
@@ -499,6 +484,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._sampler.set_epoch(curr_epoch)
 
             pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
+            # pbar = tqdm(total=self._steps_per_epoch, disable=False)
             for idx, batch in enumerate(self._dataloader):
                 if (
                     self.max_steps_per_epoch is not None
@@ -507,12 +493,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     break
 
+                # print("here1")
+
                 # Both are shape [b, s]
                 tokens, labels = batch["tokens"], batch["labels"]
                 # Get the attention mask and position ids from the dataset if they
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
                 input_pos = batch.get("input_pos", None)  # shape [b, s]
+
+                # print("here2")
 
                 tokens = tokens.to(self._device)
                 num_tokens += tokens.numel()
@@ -522,6 +512,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
+                # print("here3")
+
                 logits = self._model(tokens, mask=mask, input_pos=input_pos)
                 # Shift so that tokens < n predict n
                 logits = logits[..., :-1, :].contiguous()
@@ -530,13 +522,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Compute loss
                 loss = self._loss_fn(logits, labels)
 
+                # print("here4")
+
                 loss = loss / self._gradient_accumulation_steps
                 running_loss += loss
                 loss.backward()
 
+                # print("here5")
+
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    # print("here51")
                     self._optimizer.step()
+                    # print("here52")
                     self._optimizer.zero_grad(set_to_none=True)
 
                     # Update the number of steps when the weights are updated
@@ -570,6 +568,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     running_loss = 0
                     num_tokens = 0
                     t0 = time.perf_counter()
+
+                # print("here6")
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)

@@ -87,6 +87,7 @@ loss:
   _component_: torch.nn.CrossEntropyLoss
 max_steps_per_epoch: null
 gradient_accumulation_steps: 1
+compile: False
 
 
 # Training env
@@ -96,6 +97,9 @@ device: cuda
 enable_activation_checkpointing: True
 memory_efficient_fsdp_wrap: True
 fsdp_cpu_offload: True
+
+fsdp:  # FSDP2
+  cpu_offload: True
 
 # Reduced precision
 dtype: bf16
