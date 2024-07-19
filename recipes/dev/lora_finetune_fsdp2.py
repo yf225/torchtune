@@ -366,6 +366,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         if compile_model:
             log.info("Compiling model with torch.compile...")
             backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
+            torch._dynamo.config.inline_inbuilt_nn_modules = True
             model.compile(backend=backend)
 
         if self._is_rank_zero:
