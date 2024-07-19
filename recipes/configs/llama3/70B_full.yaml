@@ -98,6 +98,9 @@ enable_activation_checkpointing: True
 memory_efficient_fsdp_wrap: True
 fsdp_cpu_offload: True
 
+fsdp:  # FSDP2
+  cpu_offload: True
+
 # Reduced precision
 dtype: bf16
 

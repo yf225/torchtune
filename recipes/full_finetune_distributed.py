@@ -342,9 +342,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             ),
         )
 
-        if self._is_rank_zero:
-            print(f"after: model: {model}")
-
         # Ensure no params and buffers are on meta device
         utils.validate_no_params_on_meta_device(model)
 
@@ -353,6 +350,9 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             utils.set_activation_checkpointing(
                 model, auto_wrap_policy={modules.TransformerDecoderLayer}
             )
+
+        if self._is_rank_zero:
+            print(f"after: model: {model}")
 
         if self._is_rank_zero:
             memory_stats = utils.get_memory_stats(device=self._device)

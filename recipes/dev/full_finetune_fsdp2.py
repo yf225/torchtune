@@ -282,8 +282,14 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         if self._dtype == torch.bfloat16:
             model = model.to(torch.bfloat16)
 
-        # # Load both the model weights. This should happen only on Rank 0
-        # model.load_state_dict(model_state_dict)
+        model._apply(
+            lambda t: torch.empty_like(t, device="cpu")
+            if isinstance(t, torch.nn.Parameter) else torch.empty_like(t, device="cuda"),
+            recurse=True,
+        )
+
+        # Load both the model weights. This should happen only on Rank 0
+        model.load_state_dict(model_state_dict)
 
         if self._is_rank_zero:
             print(f"self._dtype: {self._dtype}")
@@ -301,8 +307,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             from torch.distributed._composable.fsdp import CPUOffloadPolicy
 
             fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
-        # iterating from lowerer modules to higher
-        # eg grouping lora adapters before transformer block
         for m_name, m in reversed(list(model.named_modules())):
             if memory_efficient_fsdp_wrap:
                 if isinstance(m, nn.Embedding):
@@ -323,9 +327,6 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
 
         if self._is_rank_zero:
             print(f"after: model: {model}")
-
-        device = torch.device("cuda", torch.cuda.current_device())
-        model.to_empty(device=device)
 
         # Ensure no params and buffers are on meta device
         utils.validate_no_params_on_meta_device(model)
@@ -361,7 +362,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             optimizer.load_state_dict(opt_state_dict)
 
         if self._is_rank_zero:
-            log.info("Optimizer is initialized.")
+            log.info(f"Optimizer is initialized: {optimizer}, type: {type(optimizer)}")
+            # log.info(f"optimizer.param_groups: {optimizer.param_groups}")
         return optimizer
 
     def _setup_data(
@@ -481,6 +483,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
             self._sampler.set_epoch(curr_epoch)
 
             pbar = tqdm(total=self._steps_per_epoch, disable=not (rank == 0))
+            # pbar = tqdm(total=self._steps_per_epoch, disable=False)
             for idx, batch in enumerate(self._dataloader):
                 if (
                     self.max_steps_per_epoch is not None
@@ -489,12 +492,16 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     break
 
+                # print("here1")
+
                 # Both are shape [b, s]
                 tokens, labels = batch["tokens"], batch["labels"]
                 # Get the attention mask and position ids from the dataset if they
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
                 input_pos = batch.get("input_pos", None)  # shape [b, s]
+
+                # print("here2")
 
                 tokens = tokens.to(self._device)
                 num_tokens += tokens.numel()
@@ -504,6 +511,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
+                # print("here3")
+
                 logits = self._model(tokens, mask=mask, input_pos=input_pos)
                 # Shift so that tokens < n predict n
                 logits = logits[..., :-1, :].contiguous()
@@ -512,13 +521,19 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                 # Compute loss
                 loss = self._loss_fn(logits, labels)
 
+                # print("here4")
+
                 loss = loss / self._gradient_accumulation_steps
                 running_loss += loss
                 loss.backward()
 
+                # print("here5")
+
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
+                    # print("here51")
                     self._optimizer.step()
+                    # print("here52")
                     self._optimizer.zero_grad(set_to_none=True)
 
                     # Update the number of steps when the weights are updated
@@ -552,6 +567,8 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                     running_loss = 0
                     num_tokens = 0
                     t0 = time.perf_counter()
+
+                # print("here6")
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)
