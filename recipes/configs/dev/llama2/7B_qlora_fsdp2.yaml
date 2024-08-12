@@ -76,6 +76,7 @@ epochs: 1
 max_steps_per_epoch: null
 gradient_accumulation_steps: 2
 compile: False
+trace_fsdp: False
 
 # Logging
 output_dir: /tmp/qlora_finetune_output/

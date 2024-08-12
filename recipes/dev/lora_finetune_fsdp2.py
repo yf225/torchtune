@@ -7,6 +7,7 @@
 import os
 import sys
 import time
+import contextlib
 
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
@@ -142,6 +143,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
+        self._trace_fsdp = cfg.trace_fsdp
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
@@ -654,19 +656,30 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
-                logits = self._model(tokens, mask=mask, input_pos=input_pos)
-                # Shift so that tokens < n predict n
-                logits = logits[..., :-1, :].contiguous()
-                labels = labels[..., 1:].contiguous()
-                logits = logits.transpose(1, 2)
-                # Compute loss
-                loss = self._loss_fn(logits, labels)
-                # free logits otherwise it peaks backward memory
-                del logits
+                if self._trace_fsdp and idx == 0:
+                    # warmup
+                    _ = self._model(tokens, mask=mask, input_pos=input_pos)
 
-                loss = loss / self._gradient_accumulation_steps
-                running_loss += loss
-                loss.backward()
+                if self._trace_fsdp:
+                    maybe_compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
+                        lambda gm: torch.compile(gm, backend="inductor", fullgraph=True)
+                    )
+                else:
+                    maybe_compiled_autograd_ctx = contextlib.nullcontext()
+                with maybe_compiled_autograd_ctx:
+                    logits = self._model(tokens, mask=mask, input_pos=input_pos)
+                    # Shift so that tokens < n predict n
+                    logits = logits[..., :-1, :].contiguous()
+                    labels = labels[..., 1:].contiguous()
+                    logits = logits.transpose(1, 2)
+                    # Compute loss
+                    loss = self._loss_fn(logits, labels)
+                    # free logits otherwise it peaks backward memory
+                    del logits
+
+                    loss = loss / self._gradient_accumulation_steps
+                    running_loss += loss
+                    loss.backward()
 
                 # Step with optimizer
                 if (idx + 1) % self._gradient_accumulation_steps == 0:
