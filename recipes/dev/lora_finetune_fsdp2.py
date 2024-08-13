@@ -143,6 +143,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
+        self._compile = cfg.compile
         self._trace_fsdp = cfg.trace_fsdp
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
@@ -222,7 +223,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 else None
             ),
             cfg_fsdp=cfg.fsdp if hasattr(cfg, "fsdp") else None,
-            compile=cfg.compile,
         )
         self._tokenizer = config.instantiate(cfg.tokenizer)
 
@@ -340,7 +340,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         base_model_state_dict: Dict[str, Any],
         lora_weights_state_dict: Optional[Dict[str, Any]] = None,
         cfg_fsdp: Optional[Union[DictConfig, None]] = None,
-        compile: bool = False,
     ) -> nn.Module:
         """
         Model initialization has some important considerations:
@@ -429,16 +428,19 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         # Ensure no params and buffers are on meta device
         utils.validate_no_params_on_meta_device(model)
 
-        if compile:
-            backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
-            model.compile(backend=backend)
-
         if self._is_rank_zero:
             log.info(
                 f"Instantiating model and loading checkpoint took {time.perf_counter() - init_start:.2f} secs"
             )
             memory_stats = utils.get_memory_stats(device=self._device)
             utils.log_memory_stats(memory_stats)
+
+        # TODO(yf225): remove this after debugging
+        from collections import OrderedDict
+        str_indices = [str(i) for i in range(len(model.layers._modules))][:1]  # only pick the first few layers
+        model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
+        print(f"model: {model}")
+        # TODO(yf225): remove above after debugging
 
         # synchronize before training begins
         torch.distributed.barrier()
@@ -624,6 +626,17 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
 
+        if self._trace_fsdp:
+            torch._dynamo.config.inline_inbuilt_nn_modules = True
+            torch._functorch.config.recompute_views = True
+            torch._functorch.config.cse = False
+            torch._inductor.config.reorder_for_compute_comm_overlap = False  # True
+            torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+                "sink_waits",
+                "raise_comms",
+                "reorder_compute_for_overlap",
+            ]
+
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
@@ -657,8 +670,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 )
 
                 if self._trace_fsdp and idx == 0:
-                    # warmup
+                    assert self._compile
+                    # run warmup, then run compile
                     _ = self._model(tokens, mask=mask, input_pos=input_pos)
+                    # if torch.distributed.get_rank() != 0:
+                    #     # HACK: delay other ranks by X seconds, so that rank 0 will always fail first.
+                    #     time.sleep(600)
+                    self._model.compile(backend="inductor", fullgraph=True)  # TODO(yf225): set fullgraph=False when ready to ship
 
                 if self._trace_fsdp:
                     maybe_compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
