@@ -647,11 +647,17 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Both are shape [b, s]
                 tokens, labels = batch["tokens"], batch["labels"]
-                torch._dynamo.mark_dynamic(tokens, 1)
                 # Get the attention mask and position ids from the dataset if they
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
                 input_pos = batch.get("input_pos", None)  # shape [b, s]
+                torch._dynamo.mark_dynamic(tokens, 1)
+                torch._dynamo.mark_dynamic(labels, 1)
+                if mask is not None:
+                    torch._dynamo.mark_dynamic(mask, 1)
+                    torch._dynamo.mark_dynamic(mask, 2)
+                if input_pos is not None:
+                    torch._dynamo.mark_dynamic(input_pos, 1)
 
                 tokens = tokens.to(self._device)
                 num_tokens += tokens.numel()
