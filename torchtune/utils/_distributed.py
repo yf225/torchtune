@@ -303,6 +303,8 @@ def load_from_full_model_state_dict(
     sharded_sd = {}
     for param_name, full_tensor in full_sd.items():
         sharded_meta_param = meta_sharded_sd.get(param_name)
+        if sharded_meta_param is None:
+            continue
         full_tensor = full_tensor.to(sharded_meta_param.dtype).to(device)
         if isinstance(sharded_meta_param._local_tensor, NF4Tensor):
             full_tensor = to_nf4(full_tensor)

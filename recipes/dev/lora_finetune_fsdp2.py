@@ -145,6 +145,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
         self._compile = cfg.compile
         self._trace_fsdp = cfg.trace_fsdp
+        self._cudagraphs = cfg.cudagraphs
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
@@ -365,6 +366,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         with utils.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
+        # # TODO(yf225): remove this after debugging
+        # from collections import OrderedDict
+        # str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
+        # model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
+        print(f"model: {model}")
+        # TODO(yf225): remove above after debugging
+
         self.adapter_params = get_adapter_params(model)
         set_trainable_params(model, self.adapter_params)
 
@@ -380,6 +388,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
         # iterating from lowerer modules to higher
         # eg grouping lora adapters before transformer block
+        # TODO(yf225): does the wrapping order actually matter here? is it the source of problem for compiled FSDP2?
         for m in reversed(list(model.modules())):
             if isinstance(m, nn.Linear) and m.weight.requires_grad:
                 fully_shard(m, **fsdp_kwargs)
@@ -434,13 +443,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             )
             memory_stats = utils.get_memory_stats(device=self._device)
             utils.log_memory_stats(memory_stats)
-
-        # TODO(yf225): remove this after debugging
-        from collections import OrderedDict
-        str_indices = [str(i) for i in range(len(model.layers._modules))][:1]  # only pick the first few layers
-        model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
-        print(f"model: {model}")
-        # TODO(yf225): remove above after debugging
 
         # synchronize before training begins
         torch.distributed.barrier()
@@ -626,17 +628,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
 
-        if self._trace_fsdp:
-            torch._dynamo.config.inline_inbuilt_nn_modules = True
-            torch._functorch.config.recompute_views = True
-            torch._functorch.config.cse = False
-            torch._inductor.config.reorder_for_compute_comm_overlap = False  # True
-            torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
-                "sink_waits",
-                "raise_comms",
-                "reorder_compute_for_overlap",
-            ]
-
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
         for curr_epoch in range(self.epochs_run, self.total_epochs):
@@ -656,6 +647,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
                 # Both are shape [b, s]
                 tokens, labels = batch["tokens"], batch["labels"]
+                torch._dynamo.mark_dynamic(tokens, 1)
                 # Get the attention mask and position ids from the dataset if they
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
@@ -669,18 +661,36 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
-                if self._trace_fsdp and idx == 0:
-                    assert self._compile
+                backend = "aot_eager"
+                torch._dynamo.config.dynamic_shapes = True
+                torch._inductor.config.triton.cudagraphs = self._cudagraphs
+                torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
+                if self._trace_fsdp:
+                    torch._dynamo.config.skip_fsdp_hooks = False
+                    torch._dynamo.config.inline_inbuilt_nn_modules = True
+                    torch._functorch.config.recompute_views = True
+                    torch._functorch.config.cse = False
+                    torch._inductor.config.reorder_for_compute_comm_overlap = False
+                    torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
+                        "sink_waits",
+                        "raise_comms",
+                        "reorder_compute_for_overlap",
+                    ]
+                else:
+                    torch._dynamo.config.skip_fsdp_hooks = True
+                    torch._dynamo.config.inline_inbuilt_nn_modules = True
+
+                if self._compile and idx == 0:
                     # run warmup, then run compile
                     _ = self._model(tokens, mask=mask, input_pos=input_pos)
                     # if torch.distributed.get_rank() != 0:
                     #     # HACK: delay other ranks by X seconds, so that rank 0 will always fail first.
                     #     time.sleep(600)
-                    self._model.compile(backend="inductor", fullgraph=True)  # TODO(yf225): set fullgraph=False when ready to ship
+                    self._model.compile(backend=backend, fullgraph=self._trace_fsdp)  # TODO(yf225): set fullgraph=False when ready to ship
 
                 if self._trace_fsdp:
                     maybe_compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
-                        lambda gm: torch.compile(gm, backend="inductor", fullgraph=True)
+                        lambda gm: torch.compile(gm, backend=backend, fullgraph=True)
                     )
                 else:
                     maybe_compiled_autograd_ctx = contextlib.nullcontext()
