@@ -70,8 +70,8 @@ loss:
 
 # Training
 epochs: 1
-max_steps_per_epoch: 30
-gradient_accumulation_steps: 2
+max_steps_per_epoch: null
+gradient_accumulation_steps: 32
 compile: False
 trace_fsdp: False
 cudagraphs: False

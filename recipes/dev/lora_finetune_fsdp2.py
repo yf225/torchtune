@@ -388,7 +388,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
         # iterating from lowerer modules to higher
         # eg grouping lora adapters before transformer block
-        # TODO(yf225): does the wrapping order actually matter here? is it the source of problem for compiled FSDP2?
         for m in reversed(list(model.modules())):
             if isinstance(m, nn.Linear) and m.weight.requires_grad:
                 fully_shard(m, **fsdp_kwargs)
@@ -651,13 +650,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
                 input_pos = batch.get("input_pos", None)  # shape [b, s]
-                torch._dynamo.mark_dynamic(tokens, 1)
-                torch._dynamo.mark_dynamic(labels, 1)
-                if mask is not None:
-                    torch._dynamo.mark_dynamic(mask, 1)
-                    torch._dynamo.mark_dynamic(mask, 2)
-                if input_pos is not None:
-                    torch._dynamo.mark_dynamic(input_pos, 1)
 
                 tokens = tokens.to(self._device)
                 num_tokens += tokens.numel()
@@ -667,8 +659,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
-                backend = "aot_eager"
-                torch._dynamo.config.dynamic_shapes = True
+                backend = "inductor"
                 torch._inductor.config.triton.cudagraphs = self._cudagraphs
                 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
                 if self._trace_fsdp:
@@ -676,7 +667,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     torch._dynamo.config.inline_inbuilt_nn_modules = True
                     torch._functorch.config.recompute_views = True
                     torch._functorch.config.cse = False
-                    torch._inductor.config.reorder_for_compute_comm_overlap = False
+                    torch._inductor.config.reorder_for_compute_comm_overlap = True
                     torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
                         "sink_waits",
                         "raise_comms",
