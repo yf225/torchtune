@@ -366,10 +366,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         with utils.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
-        # # TODO(yf225): remove this after debugging
-        # from collections import OrderedDict
-        # str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
-        # model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
+        # TODO(yf225): remove this after debugging
+        from collections import OrderedDict
+        str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
+        model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
         print(f"model: {model}")
         # TODO(yf225): remove above after debugging
 
