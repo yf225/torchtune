@@ -685,7 +685,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     #     time.sleep(600)
                     self._model.compile(backend=backend, fullgraph=self._trace_fsdp)  # TODO(yf225): set fullgraph=False when ready to ship
 
-                if self._trace_fsdp:
+                if self._compile and self._trace_fsdp:
                     maybe_compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
                         lambda gm: torch.compile(gm, backend=backend, fullgraph=True)
                     )
