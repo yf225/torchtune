@@ -12,6 +12,7 @@ import contextlib
 from functools import partial
 from typing import Any, Dict, Optional, Tuple, Union
 from warnings import warn
+from datetime import datetime
 
 import torch
 from omegaconf import DictConfig, ListConfig
@@ -41,6 +42,45 @@ from torchtune.utils import DummyProfiler, PROFILER_KEY
 from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
+backend = "inductor"
+
+
+import socket
+from datetime import datetime, timedelta
+
+# Keep a max of 100,000 alloc/free events in the recorded history
+# leading up to the memory snapshot.
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
+
+def start_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not recording memory history")
+       return
+
+   log.info("Starting memory snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(
+       max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+   )
+
+def stop_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not recording memory history")
+       return
+
+   log.info("Stopping memory snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(enabled=None)
+
+def export_memory_snapshot(filepath_prefix) -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not exporting memory snapshot")
+       return
+
+   try:
+       log.info(f"Saving memory snapshot to local file: {filepath_prefix}.pickle")
+       torch.cuda.memory._dump_snapshot(f"{filepath_prefix}.pickle")
+   except Exception as e:
+       log.info(f"Failed to capture memory snapshot {e}")
+       return
 
 
 class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
@@ -144,6 +184,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self._resume_from_checkpoint = cfg.resume_from_checkpoint
         self._gradient_accumulation_steps = cfg.gradient_accumulation_steps
         self._compile = cfg.compile
+        self._per_layer_compile = cfg.per_layer_compile
         self._trace_fsdp = cfg.trace_fsdp
         self._cudagraphs = cfg.cudagraphs
 
@@ -368,13 +409,18 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
 
         # TODO(yf225): remove this after debugging
         from collections import OrderedDict
-        str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
-        model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
+        # str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
+        # model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
         print(f"model: {model}")
         # TODO(yf225): remove above after debugging
 
         self.adapter_params = get_adapter_params(model)
         set_trainable_params(model, self.adapter_params)
+
+        if self._compile and self._per_layer_compile:
+            for m in reversed(list(model.modules())):
+                if isinstance(m, modules.TransformerDecoderLayer):
+                    m.compile(backend=backend)
 
         if enable_activation_checkpointing:
             utils.set_activation_checkpointing(
@@ -626,6 +672,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         t0 = time.perf_counter()
         running_loss = 0
         num_tokens = 0
+        is_recording_memory_history = False
 
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -644,6 +691,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     break
 
+                if idx == 0 and torch.distributed.get_rank() == 0:
+                    is_recording_memory_history = True
+                    start_record_memory_history()
+
                 # Both are shape [b, s]
                 tokens, labels = batch["tokens"], batch["labels"]
                 # Get the attention mask and position ids from the dataset if they
@@ -659,7 +710,6 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     input_pos.to(self._device) if input_pos is not None else None
                 )
 
-                backend = "inductor"
                 torch._inductor.config.triton.cudagraphs = self._cudagraphs
                 torch._inductor.config.triton.cudagraph_skip_dynamic_graphs = True
                 if self._trace_fsdp:
@@ -683,7 +733,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     # if torch.distributed.get_rank() != 0:
                     #     # HACK: delay other ranks by X seconds, so that rank 0 will always fail first.
                     #     time.sleep(600)
-                    self._model.compile(backend=backend, fullgraph=self._trace_fsdp)  # TODO(yf225): set fullgraph=False when ready to ship
+                    if not self._per_layer_compile:
+                        self._model.compile(backend=backend, fullgraph=self._trace_fsdp)  # TODO(yf225): set fullgraph=False when ready to ship
 
                 if self._compile and self._trace_fsdp:
                     maybe_compiled_autograd_ctx = torch._dynamo.compiled_autograd.enable(
@@ -738,6 +789,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                             log_dict,
                             step=self.global_step,
                         )
+
+                    if torch.distributed.get_rank() == 0 and is_recording_memory_history:
+                        export_memory_snapshot(f"memory_snapshot/{int(datetime.now().timestamp())}_memory_snapshot")
+                        stop_record_memory_history()
+                        is_recording_memory_history = False
 
                     # Reset running stats for the next step
                     running_loss = 0

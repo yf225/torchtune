@@ -70,9 +70,10 @@ loss:
 
 # Training
 epochs: 1
-max_steps_per_epoch: null
-gradient_accumulation_steps: 32
+max_steps_per_epoch: 80
+gradient_accumulation_steps: 4
 compile: False
+per_layer_compile: False
 trace_fsdp: False
 cudagraphs: False
 
@@ -82,7 +83,7 @@ metric_logger:
   _component_: torchtune.utils.metric_logging.DiskLogger
   log_dir: ${output_dir}
 log_every_n_steps: 1
-log_peak_memory_stats: False
+log_peak_memory_stats: True
 
 # Environment
 device: cuda
@@ -110,7 +111,7 @@ profiler:
 
   # `torch.profiler.schedule` options:
   # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
-  wait_steps: 5
-  warmup_steps: 5
-  active_steps: 2
+  wait_steps: 3
+  warmup_steps: 3
+  active_steps: 4
   num_cycles: 1
