@@ -45,9 +45,6 @@ log = utils.get_logger("DEBUG")
 backend = "inductor"
 
 
-import socket
-from datetime import datetime, timedelta
-
 # Keep a max of 100,000 alloc/free events in the recorded history
 # leading up to the memory snapshot.
 MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
@@ -186,7 +183,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         self._compile = cfg.compile
         self._per_layer_compile = cfg.per_layer_compile
         self._trace_fsdp = cfg.trace_fsdp
+        self._memory_snapshot_start_step = cfg.memory_snapshot_start_step
         self._cudagraphs = cfg.cudagraphs
+        self._no_loss_fn = cfg.no_loss_fn
+        self._debug = cfg.debug
 
     def load_checkpoint(self, cfg_checkpointer: DictConfig) -> Dict[str, Any]:
         """
@@ -407,12 +407,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         with utils.set_default_dtype(self._dtype), torch.device("meta"):
             model = config.instantiate(cfg_model)
 
-        # TODO(yf225): remove this after debugging
-        from collections import OrderedDict
-        # str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
-        # model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
+        if self._debug:
+            from collections import OrderedDict
+            str_indices = [str(i) for i in range(len(model.layers._modules))][:3]  # only pick the first few layers
+            model.layers._modules = OrderedDict(list(zip(str_indices, model.layers._modules.values())))
         print(f"model: {model}")
-        # TODO(yf225): remove above after debugging
 
         self.adapter_params = get_adapter_params(model)
         set_trainable_params(model, self.adapter_params)
@@ -466,6 +465,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 # RoPE is not covered in state dict
                 if isinstance(m, modules.RotaryPositionalEmbeddings):
                     m.reset_parameters()
+                if hasattr(m, "rope_init"):
+                    m.rope_init()
 
         base_missing, base_unexpected = utils.load_from_full_model_state_dict(
             model, base_model_state_dict, self._device, self._is_rank_zero
@@ -673,6 +674,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         running_loss = 0
         num_tokens = 0
         is_recording_memory_history = False
+        profiler_step = 0
 
         self._profiler.start()
         # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -691,7 +693,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 ):
                     break
 
-                if idx == 0 and torch.distributed.get_rank() == 0:
+                if profiler_step == self._memory_snapshot_start_step and self._is_rank_zero:
                     is_recording_memory_history = True
                     start_record_memory_history()
 
@@ -744,12 +746,15 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     maybe_compiled_autograd_ctx = contextlib.nullcontext()
                 with maybe_compiled_autograd_ctx:
                     logits = self._model(tokens, mask=mask, input_pos=input_pos)
-                    # Shift so that tokens < n predict n
-                    logits = logits[..., :-1, :].contiguous()
-                    labels = labels[..., 1:].contiguous()
-                    logits = logits.transpose(1, 2)
-                    # Compute loss
-                    loss = self._loss_fn(logits, labels)
+                    if self._no_loss_fn:
+                        loss = logits.sum()
+                    else:
+                        # Shift so that tokens < n predict n
+                        logits = logits[..., :-1, :].contiguous()
+                        labels = labels[..., 1:].contiguous()
+                        logits = logits.transpose(1, 2)
+                        # Compute loss
+                        loss = self._loss_fn(logits, labels)
                     # free logits otherwise it peaks backward memory
                     del logits
 
@@ -784,16 +789,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                             "tokens_per_second_per_gpu": num_tokens / time_per_step,
                         }
                         if self._log_peak_memory_stats:
-                            log_dict.update(utils.get_memory_stats(device=self._device))
+                            memory_stats = utils.get_memory_stats(device=self._device)
+                            log_dict.update(memory_stats)
+                            log.info(f"memory stats: {str(memory_stats)}")
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
                         )
-
-                    if torch.distributed.get_rank() == 0 and is_recording_memory_history:
-                        export_memory_snapshot(f"memory_snapshot/{int(datetime.now().timestamp())}_memory_snapshot")
-                        stop_record_memory_history()
-                        is_recording_memory_history = False
 
                     # Reset running stats for the next step
                     running_loss = 0
@@ -804,6 +806,12 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     # Note that this is called within gradient accumulation block, hence
                     # will include multiple forward / backward passes if gradient accumulation > 1
                     self._profiler.step()
+                    profiler_step += 1
+
+                    if self._is_rank_zero and is_recording_memory_history:
+                        export_memory_snapshot(f"memory_snapshot/{int(datetime.now().timestamp())}_memory_snapshot")
+                        stop_record_memory_history()
+                        is_recording_memory_history = False
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)
