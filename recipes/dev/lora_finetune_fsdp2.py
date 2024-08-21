@@ -749,6 +749,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                     if self._no_loss_fn:
                         loss = logits.sum()
                     else:
+                        logits = logits.float()
                         # Shift so that tokens < n predict n
                         logits = logits[..., :-1, :].contiguous()
                         labels = labels[..., 1:].contiguous()

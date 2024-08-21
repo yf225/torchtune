@@ -72,7 +72,7 @@ per_layer_compile: False
 trace_fsdp: False
 cudagraphs: False
 debug: False
-memory_snapshot_start_step: 20
+memory_snapshot_start_step: 8
 
 # Logging
 output_dir: /tmp/Qwen2-0.5B-Instruct-lora-finetune
@@ -109,7 +109,7 @@ profiler:
 
   # `torch.profiler.schedule` options:
   # wait_steps -> wait, warmup_steps -> warmup, active_steps -> active, num_cycles -> repeat
-  wait_steps: 20
-  warmup_steps: 3
-  active_steps: 4
+  wait_steps: 2
+  warmup_steps: 2
+  active_steps: 3
   num_cycles: 1

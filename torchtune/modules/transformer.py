@@ -404,5 +404,6 @@ class TiedEmbeddingTransformerDecoder(nn.Module):
         h = self.norm(h)
 
         # shape: [b, s, out_dim] - out_dim is usually the vocab size
-        output = F.linear(h, self.tok_embeddings.weight).float()
+        # output = F.linear(h, self.tok_embeddings.weight).float()
+        output = F.linear(h, self.tok_embeddings.weight)  # DEBUG
         return output
