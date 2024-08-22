@@ -130,6 +130,9 @@ class LoRALinear(nn.Module, AdapterModule):
         lora_out = (self.alpha / self.rank) * self.lora_b(lora_out)
         return out + lora_out
 
+    def extra_repr(self) -> str:
+        return f"quantize_base={self._quantize_base}"
+
 
 def _lora_a_init_params(x: nn.Linear) -> None:
     """

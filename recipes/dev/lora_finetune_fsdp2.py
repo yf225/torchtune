@@ -74,10 +74,24 @@ def export_memory_snapshot(filepath_prefix) -> None:
 
    try:
        log.info(f"Saving memory snapshot to local file: {filepath_prefix}.pickle")
+       create_dir_from_prefix(filepath_prefix)
        torch.cuda.memory._dump_snapshot(f"{filepath_prefix}.pickle")
    except Exception as e:
        log.info(f"Failed to capture memory snapshot {e}")
        return
+
+def create_dir_from_prefix(filepath_prefix):
+    # Extract the directory path from the filepath_prefix
+    dir_path = os.path.dirname(filepath_prefix)
+    
+    # Create the dir if it doesn't exist
+    if not os.path.exists(dir_path):
+        os.makedirs(dir_path)
+        print(f"dir created: {dir_path}")
+    else:
+        print(f"dir already exists: {dir_path}")
+    
+    return dir_path
 
 
 class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
@@ -703,6 +717,13 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                 # exist. Currently, only sample packing in PackedDataset returns these
                 mask = batch.get("mask", None)  # shape [b, s, s]
                 input_pos = batch.get("input_pos", None)  # shape [b, s]
+                # torch._dynamo.mark_dynamic(tokens, 1)
+                # torch._dynamo.mark_dynamic(labels, 1)
+                # if mask is not None:
+                #     torch._dynamo.mark_dynamic(mask, 1)
+                #     torch._dynamo.mark_dynamic(mask, 2)
+                # if input_pos is not None:
+                #     torch._dynamo.mark_dynamic(input_pos, 1)
 
                 tokens = tokens.to(self._device)
                 num_tokens += tokens.numel()
