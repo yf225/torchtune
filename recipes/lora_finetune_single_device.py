@@ -199,14 +199,20 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         Setup the recipe state. This includes recipe state (if resume_from_checkpoint is True),
         model, tokenizer, loss, optimizer, learning rate scheduler, sampler, and dataloader.
         """
-        self._metric_logger = config.instantiate(cfg.metric_logger)
+        # self._metric_logger = config.instantiate(cfg.metric_logger)
 
         # log config with parameter override
-        self._metric_logger.log_config(cfg)
+        # self._metric_logger.log_config(cfg)
 
         self._model_compile = cfg.compile
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
 
+        # initialize loss
+        self._loss_fn = config.instantiate(cfg.loss)
+        self.num_output_chunks = getattr(self._loss_fn, "num_output_chunks", 0)
+        log.info("Loss is initialized.")
+
+        # set up model
         self._model = self._setup_model(
             cfg_model=cfg.model,
             enable_activation_checkpointing=cfg.enable_activation_checkpointing,
@@ -228,9 +234,6 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 checkpoint_dict[utils.OPT_KEY] if self._resume_from_checkpoint else None
             ),
         )
-
-        self._loss_fn = config.instantiate(cfg.loss)
-        log.info("Loss is initialized.")
 
         # Dataloader depends on the tokenizer and loss_fn and should be
         # setup after all of these are setup
@@ -268,6 +271,11 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         # Set up profiler, returns DummyProfiler (nullcontext object with no-op `step` method)
         # if cfg is missing profiler key or if `cfg.profiler.enabled = False
         self._profiler = self._setup_profiler(cfg.get(PROFILER_KEY, None))
+
+        # Used to ignore labels for loss computation
+        self.ignore_labels_cache = torch.full(
+            (cfg.batch_size, 1), self._loss_fn.ignore_index, device=self._device
+        )
 
     def _setup_profiler(
         self, cfg_profiler: Optional[DictConfig] = None
@@ -344,8 +352,10 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         base_model_state_dict: Dict[str, Any],
         lora_weights_state_dict: Optional[Dict[str, Any]] = None,
     ) -> nn.Module:
+
         with utils.set_default_dtype(self._dtype), self._device:
             model = config.instantiate(cfg_model)
+        model.set_num_output_chunks(self.num_output_chunks)
 
         self._lora_rank = cfg_model.lora_rank
         self._lora_alpha = cfg_model.lora_alpha
@@ -392,6 +402,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
             self._loss_step_original = self._loss_step
             self._loss_step = torch.compile(self._loss_step, backend=backend)
+            # model = torch.compile(model, backend=backend)
 
         if self._device.type == "cuda":
             memory_stats = utils.get_memory_stats(device=self._device)
@@ -534,21 +545,23 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             adapter_only=self._save_adapter_weights_only,
         )
 
-    def _loss_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        # Both are shape [b, s]
-        tokens, labels = batch["tokens"], batch["labels"]
-        # Get the attention mask and position ids from the dataset if they
-        # exist. Currently, only sample packing in PackedDataset returns these
-        mask = batch.get("mask", None)  # shape [b, s, s]
-        input_pos = batch.get("input_pos", None)  # shape [b, s]
-
+    def _loss_step(self, tokens, labels, mask, input_pos) -> torch.Tensor:
+        # run model
         logits = self._model(tokens, mask=mask, input_pos=input_pos)
-        # Shift so that tokens < n predict n
-        logits = logits[..., :-1, :].contiguous()
-        labels = labels[..., 1:].contiguous()
-        logits = logits.transpose(1, 2)
+
+        # Shift labels to compute loss
+        # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
+        # But this way we dont need to slice the logits. We just add an ignore index to labels.
+        labels = torch.hstack(
+            (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
+        )
+        if not isinstance(logits, list):
+            labels = labels.reshape(-1)
+            logits = logits.reshape(-1, logits.size(-1)).float()
+
         # Compute loss
         loss = self._loss_fn(logits, labels)
+
         # free logits otherwise it peaks backward memory
         del logits
 
@@ -595,8 +608,17 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
                     batch = {k: v.to(self._device) for k, v in batch.items()}
                     num_tokens += batch["tokens"].numel()
+                    # Both are shape [b, s]
+                    tokens, labels = batch["tokens"], batch["labels"]
+                    torch._dynamo.mark_dynamic(tokens, 1)
+                    # torch._dynamo.mark_dynamic(labels, 1)
 
-                    loss = self._loss_step(batch)
+                    # Get the attention mask and position ids from the dataset if they
+                    # exist. Currently, only sample packing in PackedDataset returns these
+                    mask = batch.get("mask", None)  # shape [b, s, s]
+                    input_pos = batch.get("input_pos", None)  # shape [b, s]
+
+                    loss = self._loss_step(tokens, labels, mask, input_pos)
                     loss = loss / self._gradient_accumulation_steps
                     running_loss += loss
                     loss.backward()
@@ -630,10 +652,10 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                                 log_dict.update(
                                     utils.get_memory_stats(device=self._device)
                                 )
-                            self._metric_logger.log_dict(
-                                log_dict,
-                                step=self.global_step,
-                            )
+                            # self._metric_logger.log_dict(
+                            #     log_dict,
+                            #     step=self.global_step,
+                            # )
 
                         # Reset running stats for the next step
                         running_loss = 0
@@ -660,7 +682,8 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                 self.save_checkpoint(epoch=curr_epoch)
 
     def cleanup(self) -> None:
-        self._metric_logger.close()
+        # self._metric_logger.close()
+        pass
 
 
 @config.parse
