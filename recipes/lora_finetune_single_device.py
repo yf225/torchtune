@@ -399,6 +399,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         # Compile model, if enabled.
         if compile_model:
             log.info("Compiling model with torch.compile...")
+            torch._dynamo.config.inline_inbuilt_nn_modules = True
             backend = os.environ.get("TORCH_COMPILE_BACKEND", "inductor")
             self._loss_step_original = self._loss_step
             self._loss_step = torch.compile(self._loss_step, backend=backend)
@@ -610,7 +611,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     num_tokens += batch["tokens"].numel()
                     # Both are shape [b, s]
                     tokens, labels = batch["tokens"], batch["labels"]
-                    torch._dynamo.mark_dynamic(tokens, 1)
+                    # torch._dynamo.mark_dynamic(tokens, 1)
                     # torch._dynamo.mark_dynamic(labels, 1)
 
                     # Get the attention mask and position ids from the dataset if they
