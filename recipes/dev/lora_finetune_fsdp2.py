@@ -220,6 +220,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             ),
             cfg_fsdp=cfg.fsdp if hasattr(cfg, "fsdp") else None,
         )
+        self._model_compile = cfg.compile
+        if self._model_compile:
+            log.info("Applied torch.compile to model ...")
+            self._model = torch.compile(self._model)
+
         self._tokenizer = config.instantiate(cfg.tokenizer)
 
         self._optimizer = self._setup_optimizer(
@@ -625,6 +630,7 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                         }
                         if self._log_peak_memory_stats:
                             log_dict.update(utils.get_memory_stats(device=self._device))
+                            log.warn(f"Memory stats: {utils.get_memory_stats(device=self._device)}")
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
