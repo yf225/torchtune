@@ -28,6 +28,44 @@ from tqdm import tqdm
 
 log = utils.get_logger("DEBUG")
 
+from datetime import datetime
+
+is_recording_memory_history = False
+
+# Keep a max of 100,000 alloc/free events in the recorded history
+# leading up to the memory snapshot.
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
+
+def start_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not recording memory history")
+       return
+
+   log.info("Starting memory snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(
+       max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+   )
+
+def stop_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not recording memory history")
+       return
+
+   log.info("Stopping memory snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(enabled=None)
+
+def export_memory_snapshot(filepath_prefix) -> None:
+   if not torch.cuda.is_available():
+       log.info("CUDA unavailable. Not exporting memory snapshot")
+       return
+
+   try:
+       log.info(f"Saving memory snapshot to local file: {filepath_prefix}.pickle")
+       torch.cuda.memory._dump_snapshot(f"{filepath_prefix}.pickle")
+   except Exception as e:
+       log.info(f"Failed to capture memory snapshot {e}")
+       return
+
 
 class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
     """
@@ -496,6 +534,8 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         The core training loop. Supports training on subsets of the dataset using the
         ``max_steps_per_epoch``.
         """
+        global is_recording_memory_history
+
         if self._model_compile:
             log.info(
                 "NOTE: torch.compile is enabled and model is compiled in first forward. Expect a relatively slow first iteration."
@@ -517,6 +557,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             self._sampler.set_epoch(curr_epoch)
 
             pbar = tqdm(total=self._steps_per_epoch)
+
             for idx, batch in enumerate(self._dataloader):
                 if (
                     self.max_steps_per_epoch is not None
@@ -571,6 +612,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                         }
                         if self._device.type == "cuda" and self._log_peak_memory_stats:
                             log_dict.update(utils.get_memory_stats(device=self._device))
+                            log.warn(f"Memory stats: {utils.get_memory_stats(device=self._device)}")
                         self._metric_logger.log_dict(
                             log_dict,
                             step=self.global_step,
@@ -580,6 +622,11 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                     running_loss = 0
                     num_tokens = 0
                     t0 = time.perf_counter()
+
+                if idx == 5 and is_recording_memory_history:
+                    export_memory_snapshot(f"memory_snapshot/{int(datetime.now().timestamp())}_memory_snapshot")
+                    stop_record_memory_history()
+                    is_recording_memory_history = False
 
                 # Stop tracking CUDA memory now that active steps are complete
                 if (
@@ -608,6 +655,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
+    global is_recording_memory_history
     """
     Entry point for the recipe.
 
@@ -617,6 +665,8 @@ def recipe_main(cfg: DictConfig) -> None:
     """
     config.log_config(recipe_name="FullFinetuneRecipeSingleDevice", cfg=cfg)
     recipe = FullFinetuneRecipeSingleDevice(cfg=cfg)
+    is_recording_memory_history = True
+    start_record_memory_history()
     recipe.setup(cfg=cfg)
     recipe.train()
     recipe.cleanup()
