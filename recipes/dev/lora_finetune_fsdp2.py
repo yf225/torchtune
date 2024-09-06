@@ -205,10 +205,11 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
         model, tokenizer, loss, optimizer, learning rate scheduler, sampler, and dataloader.
         """
         if self._is_rank_zero:
-            self._metric_logger = config.instantiate(cfg.metric_logger)
+            # self._metric_logger = config.instantiate(cfg.metric_logger)
 
             # log config with parameter override
-            self._metric_logger.log_config(cfg)
+            # self._metric_logger.log_config(cfg)
+            pass
 
         checkpoint_dict = self.load_checkpoint(cfg_checkpointer=cfg.checkpointer)
         self._model_compile = cfg.get("compile", False)
@@ -682,10 +683,10 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
                             log_dict.update(
                                 training.get_memory_stats(device=self._device)
                             )
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
-                        )
+                        # self._metric_logger.log_dict(
+                        #     log_dict,
+                        #     step=self.global_step,
+                        # )
 
                     # Reset running stats for the next step
                     running_loss = 0
@@ -696,8 +697,8 @@ class LoRAFinetuneRecipeDistributed(FTRecipeInterface):
             self.save_checkpoint(epoch=curr_epoch)
 
     def cleanup(self) -> None:
-        if self._is_rank_zero:
-            self._metric_logger.close()
+        # if self._is_rank_zero:
+        #     self._metric_logger.close()
         destroy_process_group()
 
 

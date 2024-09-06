@@ -197,10 +197,10 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         Sets up the recipe state correctly. This includes setting recipe attributes based
         on the ``resume_from_checkpoint`` flag.
         """
-        self._metric_logger = config.instantiate(cfg.metric_logger)
+        # self._metric_logger = config.instantiate(cfg.metric_logger)
 
         # log config with parameter override
-        self._metric_logger.log_config(cfg)
+        # self._metric_logger.log_config(cfg)
 
         ckpt_dict = self.load_checkpoint(cfg.checkpointer)
 
@@ -621,10 +621,10 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                             )
                         if self._clip_grad_norm is not None:
                             log_dict.update({"grad_norm": grad_norm})
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
-                        )
+                        # self._metric_logger.log_dict(
+                        #     log_dict,
+                        #     step=self.global_step,
+                        # )
 
                     # Reset running stats for the next step
                     running_loss = 0
@@ -653,7 +653,8 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         self._profiler.stop()
 
     def cleanup(self) -> None:
-        self._metric_logger.close()
+        # self._metric_logger.close()
+        pass
 
 
 @config.parse
