@@ -637,12 +637,14 @@ class FlopCounterMode:
             mods: Optional[Union[torch.nn.Module, list[torch.nn.Module]]] = None,
             depth: int = 2,
             display: bool = True,
-            custom_mapping: Optional[dict[Any, Any]] = None):
+            custom_mapping: Optional[dict[Any, Any]] = None,
+            show_per_module: bool = False):
         super().__init__()
         self.flop_counts: dict[str, dict[Any, int]] = defaultdict(lambda: defaultdict(int))
         self.shape_counts: dict[str, dict[Any, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         self.depth = depth
         self.display = display
+        self.show_per_module = show_per_module
         self.mode: Optional[_FlopCounterMode] = None
         if custom_mapping is None:
             custom_mapping = {}
@@ -681,13 +683,9 @@ class FlopCounterMode:
         values = []
         global_flops = self.get_total_flops()
         global_suffix = get_suffix_str(global_flops)
-        is_global_subsumed = False
 
         def process_mod(mod_name, depth):
-            nonlocal is_global_subsumed
-
             total_flops = sum(self.flop_counts[mod_name].values())
-            is_global_subsumed |= total_flops >= global_flops
 
             padding = " " * depth
             values = []
@@ -727,23 +725,25 @@ class FlopCounterMode:
                     ])
             return values
 
-        for mod in sorted(self.flop_counts.keys()):
-            if mod == 'Global':
-                continue
-            mod_depth = mod.count(".") + 1
-            if mod_depth > depth:
-                continue
+        # Only process non-Global modules if show_per_module is True
+        if self.show_per_module:
+            for mod in sorted(self.flop_counts.keys()):
+                if mod == 'Global':
+                    continue
+                mod_depth = mod.count(".") + 1
+                if mod_depth > depth:
+                    continue
 
-            cur_values = process_mod(mod, mod_depth - 1)
-            values.extend(cur_values)
+                cur_values = process_mod(mod, mod_depth - 1)
+                values.extend(cur_values)
 
-        # We do a bit of messing around here to only output the "Global" value
-        # if there are any FLOPs in there that aren't already fully contained by
-        # a module.
-        if 'Global' in self.flop_counts and not is_global_subsumed:
-            for value in values:
-                value[0] = " " + value[0]
+            # Add spacing before Global if we showed other modules
+            if values and 'Global' in self.flop_counts:
+                for value in values:
+                    value[0] = " " + value[0]
 
+        # Always process Global
+        if 'Global' in self.flop_counts:
             values = process_mod('Global', 0) + values
 
         if len(values) == 0:
