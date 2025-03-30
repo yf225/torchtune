@@ -58,8 +58,8 @@ optimizer:
   fused: True
 loss:
   _component_: torchtune.modules.loss.CEWithChunkedOutputLoss
-max_steps_per_epoch: null
-gradient_accumulation_steps: 8  # Use to increase effective batch size
+max_steps_per_epoch: 5
+gradient_accumulation_steps: 1  # Use to increase effective batch size
 
 
 # Training env
@@ -86,7 +86,7 @@ log_peak_memory_stats: True
 # Profiler (disabled)
 profiler:
   _component_: torchtune.training.setup_torch_profiler
-  enabled: False
+  enabled: True
 
   #Output directory of trace artifacts
   output_dir: ${output_dir}/profiling_outputs

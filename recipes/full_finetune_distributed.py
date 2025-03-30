@@ -37,6 +37,7 @@ from torchtune.training.checkpointing._checkpoint_client import (
     TrainingProgress,
 )
 from torchtune.training.lr_schedulers import get_lr
+from torchtune.flop_counter import FlopCounterMode
 
 from tqdm import tqdm
 
@@ -758,173 +759,174 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         num_tokens = 0
 
         self._profiler.start()
-        # self.epochs_run should be non-zero when we're resuming from a checkpoint
-        for curr_epoch in range(self.epochs_run, self.total_epochs):
-            pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
-            self._dataloader.sampler.set_epoch(curr_epoch)
-            for idx, batch in enumerate(self._dataloader):
-                # Start tracking CUDA memory for active steps for just the first epoch
-                if (
-                    self._is_rank_zero
-                    and curr_epoch == 0
-                    and self.profiler_profile_memory
-                    and idx == self.profiler_wait_steps + self.profiler_warmup_steps
-                    and self._device.type == "cuda"
-                ):
-                    torch.cuda.memory._record_memory_history()
-                utils.batch_to_device(batch, self._device)
-
-                # Calculate the number of unmasked tokens in the current batch
-                # and increment the total number of tokens seen in the step
-                current_num_tokens = (
-                    batch["labels"] != self._loss_fn.ignore_index
-                ).sum()
-                num_tokens += current_num_tokens
-
-                # Shape [b, s], needed for the loss not the model
-                labels = batch.pop("labels")
-
-                with self.activations_handling_ctx:
-                    logits = self._model(**batch)
-                # Shift labels to compute loss
-                # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
-                # But this way we dont need to slice the logits. We just add an ignore index to labels.
-                labels = torch.hstack(
-                    (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
-                )
-                if not isinstance(logits, list):
-                    labels = labels.reshape(-1)
-                    logits = logits.reshape(-1, logits.size(-1))
-
-                # Compute loss
-                # Loss is normalized by default so we multiply by the number of tokens
-                # This way we can normalize by the total number of tokens if we're accumulating gradients
-                current_loss = self._loss_fn(logits, labels) * current_num_tokens
-
-                # free logits otherwise it peaks backward memory
-                del logits
-
-                running_loss += current_loss
-
-                # For optimizer in backward, we need to normalize before calling backward
-                # This case and gradient accumulation are mutually exclusive
-                if self._optimizer_in_bwd:
-                    torch.distributed.all_reduce(num_tokens)
-                    torch.distributed.all_reduce(running_loss)
-
-                    # We multiply by world_size to undo FSDP2 gradient normalization.
-                    current_loss = current_loss * (self.dp_size / num_tokens)
-
-                current_loss.backward()
-
-                # Step with optimizer
-                if (idx + 1) % self._gradient_accumulation_steps == 0:
-                    if not self._optimizer_in_bwd:
-                        # Get total number of tokens across all ranks to normalize gradients
-                        torch.distributed.all_reduce(num_tokens)
-                        # This will ensure that the logged loss matches what we're optimizing
-                        torch.distributed.all_reduce(running_loss)
-                        # Manually scale the gradients from unnormalized loss by total # of tokens
-                        # We multiply by world_size to undo FSDP2 gradient normalization.
-                        training.scale_grads(self._model, self.dp_size / num_tokens)
-                        if self._clip_grad_norm is not None:
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                self._model.parameters(),
-                                max_norm=float(self._clip_grad_norm),
-                            )
-                            # If sharded, collect the DTensor here
-                            if isinstance(grad_norm, DTensor):
-                                grad_norm = grad_norm.full_tensor()
-                        self._optimizer.step()
-                        self._optimizer.zero_grad(set_to_none=True)
-
-                    # Update the number of steps when the weights are updated
-                    self.global_step += 1
-
-                    # Step the learning rate scheduler
-                    if self._lr_scheduler is not None:
-                        self._lr_scheduler.step()
-
-                    loss_to_log = running_loss.item() / num_tokens
-                    pbar.update(1)
-                    pbar.set_description(
-                        f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
-                    )
-
-                    # Log per-step metrics
-                    if (
-                        self.global_step % self._log_every_n_steps == 0
-                        and self._is_rank_zero
-                    ):
-                        time_per_step = time.perf_counter() - t0
-                        log_dict = {
-                            "loss": loss_to_log,
-                            "lr": get_lr(
-                                (
-                                    self._optimizer
-                                    if not self._optimizer_in_bwd
-                                    else self._optim_ckpt_wrapper
-                                ),
-                            ),
-                            "tokens_per_second_per_gpu": num_tokens
-                            / (time_per_step * self.world_size),
-                        }
-                        if self._log_peak_memory_stats:
-                            log_dict.update(
-                                training.get_memory_stats(device=self._device)
-                            )
-                        if self._clip_grad_norm is not None:
-                            log_dict.update({"grad_norm": grad_norm})
-                        self._metric_logger.log_dict(
-                            log_dict,
-                            step=self.global_step,
-                        )
-
-                    # Reset running stats for the next step
-                    running_loss = 0
-                    num_tokens = 0
-                    t0 = time.perf_counter()
-
-                    # Stop tracking CUDA memory now that active steps are complete
+        with FlopCounterMode(display=True, depth=1) as mode:
+            # self.epochs_run should be non-zero when we're resuming from a checkpoint
+            for curr_epoch in range(self.epochs_run, self.total_epochs):
+                pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
+                self._dataloader.sampler.set_epoch(curr_epoch)
+                for idx, batch in enumerate(self._dataloader):
+                    # Start tracking CUDA memory for active steps for just the first epoch
                     if (
                         self._is_rank_zero
                         and curr_epoch == 0
                         and self.profiler_profile_memory
-                        and idx
-                        == self.profiler_wait_steps
-                        + self.profiler_warmup_steps
-                        + self.profiler_active_steps
+                        and idx == self.profiler_wait_steps + self.profiler_warmup_steps
                         and self._device.type == "cuda"
                     ):
-                        torch.cuda.memory._record_memory_history(enabled=None)
+                        torch.cuda.memory._record_memory_history()
+                    utils.batch_to_device(batch, self._device)
 
-                    # Step profiler
-                    # Note that this is called within gradient accumulation block, hence
-                    # will include multiple forward / backward passes if gradient accumulation > 1
-                    self._profiler.step()
+                    # Calculate the number of unmasked tokens in the current batch
+                    # and increment the total number of tokens seen in the step
+                    current_num_tokens = (
+                        batch["labels"] != self._loss_fn.ignore_index
+                    ).sum()
+                    num_tokens += current_num_tokens
 
-                if (
-                    (idx + 1) // self._gradient_accumulation_steps
-                ) == self.max_steps_per_epoch:
-                    break
+                    # Shape [b, s], needed for the loss not the model
+                    labels = batch.pop("labels")
 
-            self.epochs_run += 1
-            self._checkpoint_client.save_checkpoint(
-                model=self._model,
-                optimizer=(
-                    self._optimizer
-                    if not self._optimizer_in_bwd
-                    else self._optim_ckpt_wrapper
-                ),
-                training_progress=TrainingProgress(
-                    seed=self.seed,
-                    epochs_run=self.epochs_run,
-                    total_epochs=self.total_epochs,
-                    max_steps_per_epoch=self.max_steps_per_epoch,
-                    dataloader_state_dict=self._dataloader.state_dict(),
-                ),
-                epoch=curr_epoch,
-            )
+                    with self.activations_handling_ctx:
+                        logits = self._model(**batch)
+                    # Shift labels to compute loss
+                    # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
+                    # But this way we dont need to slice the logits. We just add an ignore index to labels.
+                    labels = torch.hstack(
+                        (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
+                    )
+                    if not isinstance(logits, list):
+                        labels = labels.reshape(-1)
+                        logits = logits.reshape(-1, logits.size(-1))
+
+                    # Compute loss
+                    # Loss is normalized by default so we multiply by the number of tokens
+                    # This way we can normalize by the total number of tokens if we're accumulating gradients
+                    current_loss = self._loss_fn(logits, labels) * current_num_tokens
+
+                    # free logits otherwise it peaks backward memory
+                    del logits
+
+                    running_loss += current_loss
+
+                    # For optimizer in backward, we need to normalize before calling backward
+                    # This case and gradient accumulation are mutually exclusive
+                    if self._optimizer_in_bwd:
+                        torch.distributed.all_reduce(num_tokens)
+                        torch.distributed.all_reduce(running_loss)
+
+                        # We multiply by world_size to undo FSDP2 gradient normalization.
+                        current_loss = current_loss * (self.dp_size / num_tokens)
+
+                    current_loss.backward()
+
+                    # Step with optimizer
+                    if (idx + 1) % self._gradient_accumulation_steps == 0:
+                        if not self._optimizer_in_bwd:
+                            # Get total number of tokens across all ranks to normalize gradients
+                            torch.distributed.all_reduce(num_tokens)
+                            # This will ensure that the logged loss matches what we're optimizing
+                            torch.distributed.all_reduce(running_loss)
+                            # Manually scale the gradients from unnormalized loss by total # of tokens
+                            # We multiply by world_size to undo FSDP2 gradient normalization.
+                            training.scale_grads(self._model, self.dp_size / num_tokens)
+                            if self._clip_grad_norm is not None:
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    self._model.parameters(),
+                                    max_norm=float(self._clip_grad_norm),
+                                )
+                                # If sharded, collect the DTensor here
+                                if isinstance(grad_norm, DTensor):
+                                    grad_norm = grad_norm.full_tensor()
+                            self._optimizer.step()
+                            self._optimizer.zero_grad(set_to_none=True)
+
+                        # Update the number of steps when the weights are updated
+                        self.global_step += 1
+
+                        # Step the learning rate scheduler
+                        if self._lr_scheduler is not None:
+                            self._lr_scheduler.step()
+
+                        loss_to_log = running_loss.item() / num_tokens
+                        pbar.update(1)
+                        pbar.set_description(
+                            f"{curr_epoch + 1}|{self.global_step}|Loss: {loss_to_log}"
+                        )
+
+                        # Log per-step metrics
+                        if (
+                            self.global_step % self._log_every_n_steps == 0
+                            and self._is_rank_zero
+                        ):
+                            time_per_step = time.perf_counter() - t0
+                            log_dict = {
+                                "loss": loss_to_log,
+                                "lr": get_lr(
+                                    (
+                                        self._optimizer
+                                        if not self._optimizer_in_bwd
+                                        else self._optim_ckpt_wrapper
+                                    ),
+                                ),
+                                "tokens_per_second_per_gpu": num_tokens
+                                / (time_per_step * self.world_size),
+                            }
+                            if self._log_peak_memory_stats:
+                                log_dict.update(
+                                    training.get_memory_stats(device=self._device)
+                                )
+                            if self._clip_grad_norm is not None:
+                                log_dict.update({"grad_norm": grad_norm})
+                            self._metric_logger.log_dict(
+                                log_dict,
+                                step=self.global_step,
+                            )
+
+                        # Reset running stats for the next step
+                        running_loss = 0
+                        num_tokens = 0
+                        t0 = time.perf_counter()
+
+                        # Stop tracking CUDA memory now that active steps are complete
+                        if (
+                            self._is_rank_zero
+                            and curr_epoch == 0
+                            and self.profiler_profile_memory
+                            and idx
+                            == self.profiler_wait_steps
+                            + self.profiler_warmup_steps
+                            + self.profiler_active_steps
+                            and self._device.type == "cuda"
+                        ):
+                            torch.cuda.memory._record_memory_history(enabled=None)
+
+                        # Step profiler
+                        # Note that this is called within gradient accumulation block, hence
+                        # will include multiple forward / backward passes if gradient accumulation > 1
+                        self._profiler.step()
+
+                    if (
+                        (idx + 1) // self._gradient_accumulation_steps
+                    ) == self.max_steps_per_epoch:
+                        break
+
+                self.epochs_run += 1
+                self._checkpoint_client.save_checkpoint(
+                    model=self._model,
+                    optimizer=(
+                        self._optimizer
+                        if not self._optimizer_in_bwd
+                        else self._optim_ckpt_wrapper
+                    ),
+                    training_progress=TrainingProgress(
+                        seed=self.seed,
+                        epochs_run=self.epochs_run,
+                        total_epochs=self.total_epochs,
+                        max_steps_per_epoch=self.max_steps_per_epoch,
+                        dataloader_state_dict=self._dataloader.state_dict(),
+                    ),
+                    epoch=curr_epoch,
+                )
 
         self._profiler.stop()
 
