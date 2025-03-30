@@ -759,7 +759,7 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
         num_tokens = 0
 
         self._profiler.start()
-        with FlopCounterMode(display=True, depth=1) as mode:
+        with FlopCounterMode(display=True, show_per_module=False) as mode:
             # self.epochs_run should be non-zero when we're resuming from a checkpoint
             for curr_epoch in range(self.epochs_run, self.total_epochs):
                 pbar = tqdm(total=self._steps_per_epoch, disable=not self._is_rank_zero)
@@ -911,22 +911,22 @@ class FullFinetuneRecipeDistributed(FTRecipeInterface):
                         break
 
                 self.epochs_run += 1
-                self._checkpoint_client.save_checkpoint(
-                    model=self._model,
-                    optimizer=(
-                        self._optimizer
-                        if not self._optimizer_in_bwd
-                        else self._optim_ckpt_wrapper
-                    ),
-                    training_progress=TrainingProgress(
-                        seed=self.seed,
-                        epochs_run=self.epochs_run,
-                        total_epochs=self.total_epochs,
-                        max_steps_per_epoch=self.max_steps_per_epoch,
-                        dataloader_state_dict=self._dataloader.state_dict(),
-                    ),
-                    epoch=curr_epoch,
-                )
+                # self._checkpoint_client.save_checkpoint(
+                #     model=self._model,
+                #     optimizer=(
+                #         self._optimizer
+                #         if not self._optimizer_in_bwd
+                #         else self._optim_ckpt_wrapper
+                #     ),
+                #     training_progress=TrainingProgress(
+                #         seed=self.seed,
+                #         epochs_run=self.epochs_run,
+                #         total_epochs=self.total_epochs,
+                #         max_steps_per_epoch=self.max_steps_per_epoch,
+                #         dataloader_state_dict=self._dataloader.state_dict(),
+                #     ),
+                #     epoch=curr_epoch,
+                # )
 
         self._profiler.stop()
 

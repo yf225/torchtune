@@ -52,7 +52,7 @@ collate_fn: torchtune.data.padded_collate_tiled_images_and_mask
 
 # Fine-tuning arguments
 epochs: 1
-max_steps_per_epoch: null
+max_steps_per_epoch: 1
 batch_size: 2
 gradient_accumulation_steps: 8  # Use to increase effective batch size
 optimizer:

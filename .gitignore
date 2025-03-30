@@ -187,3 +187,6 @@ cover/
 
 # wandb
 wandb/
+
+*.csv
+*.ncu-rep

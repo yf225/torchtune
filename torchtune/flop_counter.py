@@ -638,7 +638,7 @@ class FlopCounterMode:
             depth: int = 2,
             display: bool = True,
             custom_mapping: Optional[dict[Any, Any]] = None,
-            show_per_module: bool = False):
+            show_per_module: bool = True):
         super().__init__()
         self.flop_counts: dict[str, dict[Any, int]] = defaultdict(lambda: defaultdict(int))
         self.shape_counts: dict[str, dict[Any, dict[str, int]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
